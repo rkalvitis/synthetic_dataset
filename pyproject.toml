@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "popsynth"
+version = "0.1.0"
+description = "Synthetic image dataset generation from a 3D Gaussian Splat of Popillia japonica"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.1",
+    "pillow>=9.0",
+    "opencv-python>=4.8",
+    "pyyaml>=6.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+# Fast CUDA renderer. Install on the GPU machine: pip install gsplat
+cuda = ["gsplat>=1.4"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+popsynth = "popsynth.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["popsynth*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

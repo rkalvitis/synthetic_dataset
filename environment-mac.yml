@@ -1,0 +1,15 @@
+# conda env for macOS / CPU-only machines (uses the pure-PyTorch renderer, Apple MPS if available)
+name: popsynth
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - numpy
+  - pillow
+  - pyyaml
+  - tqdm
+  - pytest
+  - pip
+  - pip:
+      - torch>=2.1
+      - opencv-python>=4.8
+      - -e .

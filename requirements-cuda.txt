@@ -1,0 +1,11 @@
+# Linux + NVIDIA GPU machine: fast gsplat renderer.
+# 1) install a CUDA build of torch first, e.g.  pip install torch --index-url https://download.pytorch.org/whl/cu124
+# 2) pip install -r requirements-cuda.txt   (gsplat compiles its CUDA kernels on first import; needs nvcc)
+numpy>=1.24
+pillow>=9.0
+opencv-python-headless>=4.8
+pyyaml>=6.0
+tqdm>=4.60
+gsplat>=1.4
+pytest>=7
+-e .

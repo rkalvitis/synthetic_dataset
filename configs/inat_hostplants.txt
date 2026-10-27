@@ -1,0 +1,19 @@
+# iNaturalist taxa used as background sources (one per line, '#' = comment).
+# Host plants of Popillia japonica and typical surroundings; photos are mostly close-ups of
+# foliage, flowers and fruit, i.e. the surfaces the beetle actually sits on.
+Tilia            # linden
+Rosa             # roses
+Vitis            # grapevine
+Rubus            # raspberry / blackberry
+Prunus           # cherry, plum
+Malus            # apple
+Acer             # maple
+Ulmus            # elm
+Betula           # birch
+Glycine max      # soybean
+Zea mays         # corn
+Hibiscus         # hibiscus / rose of sharon
+Parthenocissus   # Virginia creeper
+Platanus         # plane tree
+Sambucus         # elder
+Phaseolus        # beans

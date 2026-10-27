@@ -1,0 +1,13 @@
+# large binary assets and generated data stay out of git
+assets/*.ply
+assets/*.splat
+data/
+outputs/
+*.tar
+
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+.DS_Store

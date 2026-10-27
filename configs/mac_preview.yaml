@@ -1,0 +1,13 @@
+# Laptop / CPU / Apple-MPS preview profile: same pipeline as default.yaml at lower resolution so a
+# 24-sprite + 10-image validation run takes a few minutes with the pure-PyTorch renderer.
+# Usage: popsynth generate -c configs/mac_preview.yaml
+_base: default.yaml
+render:
+  size: 1024
+  supersample: 1
+backgrounds:
+  min_size: 480
+compose:
+  image_size: [640, 640]
+output:
+  image_format: jpg
