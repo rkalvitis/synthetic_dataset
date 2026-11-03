@@ -79,9 +79,9 @@ def main() -> int:
     attr_path = os.path.join(args.out, "attribution.csv")
     seen = set()
     if os.path.exists(attr_path):
-        with open(attr_path) as f:
+        with open(attr_path, encoding="utf-8") as f:
             seen = {row["file"] for row in csv.DictReader(f)}
-    attr = open(attr_path, "a", newline="")
+    attr = open(attr_path, "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(attr, fieldnames=["file", "taxon", "photo_id", "license", "attribution", "observation_url"])
     if not seen:
         writer.writeheader()

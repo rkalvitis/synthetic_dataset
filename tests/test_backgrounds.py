@@ -22,3 +22,14 @@ def test_weighted_folders_and_min_size(tmp_path):
     picks = [pool.sample(rng, 32, 32)[1]["background"] for _ in range(300)]
     frac_small = np.mean([("small" in p) for p in picks])
     assert 0.7 < frac_small < 0.9               # weight, not file count, decides
+
+
+def test_fraction_subsamples_deterministically(tmp_path):
+    d = str(tmp_path / "many")
+    _make(d, 40, 128)
+    a = BackgroundPool([{"path": d, "fraction": 0.25}], min_size=64, seed=1)
+    b = BackgroundPool([{"path": d, "fraction": 0.25}], min_size=64, seed=1)
+    c = BackgroundPool([{"path": d, "fraction": 0.25}], min_size=64, seed=2)
+    assert len(a) == 10 and a.paths == b.paths     # same seed -> same subset
+    assert c.paths != a.paths                       # different seed -> different subset
+    assert len(BackgroundPool([{"path": d}], min_size=64)) == 40

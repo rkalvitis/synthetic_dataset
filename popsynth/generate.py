@@ -134,7 +134,8 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
     num = num or cc["num_images"]
     W, H = int(cc["image_size"][0]), int(cc["image_size"][1])
     bank = SpriteBank(sprites_dir)
-    pool = BackgroundPool(cfg["backgrounds"]["dirs"], min_size=int(cfg["backgrounds"].get("min_size", 64)))
+    pool = BackgroundPool(cfg["backgrounds"]["dirs"], min_size=int(cfg["backgrounds"].get("min_size", 64)),
+                          seed=int(cfg.get("seed", 0)))
     writer = DatasetWriter(out_dir, oc.get("image_format", "jpg"), oc.get("jpeg_quality", 95),
                            oc.get("write_masks", True), oc.get("write_yolo", True))
     if verbose:

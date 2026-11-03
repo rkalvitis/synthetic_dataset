@@ -94,17 +94,22 @@ def _category_overrides(src_dir: str) -> dict[str, str]:
 class BackgroundPool:
     """Pool of background photos from several folders.
 
-    dirs: list of folder paths, or dicts {path, weight}.  A folder is picked with probability
+    dirs: list of folder paths, or dicts {path, weight, fraction}.  A folder is picked with probability
     proportional to its weight (default 1), then a file uniformly inside it, so a small
-    high-quality folder can still dominate a large generic one.
+    high-quality folder can still dominate a large generic one.  `fraction` (0-1, default 1) keeps
+    only a deterministic random subset of the folder's files (seeded by `seed`), e.g. 0.25 to use a
+    quarter of a large generic set.
     """
 
-    def __init__(self, dirs: list, min_size: int = 64):
+    def __init__(self, dirs: list, min_size: int = 64, seed: int = 0):
         self.groups: list[tuple[str, float, list[str]]] = []
         self.min_size = min_size
         dropped = 0
         for d in dirs:
-            path, weight = (d["path"], float(d.get("weight", 1.0))) if isinstance(d, dict) else (d, 1.0)
+            if isinstance(d, dict):
+                path, weight, fraction = d["path"], float(d.get("weight", 1.0)), float(d.get("fraction", 1.0))
+            else:
+                path, weight, fraction = d, 1.0, 1.0
             if not os.path.isdir(path):
                 print(f"warning: background dir not found, skipped: {path} (see scripts/download_*backgrounds.py)")
                 continue
@@ -121,6 +126,10 @@ class BackgroundPool:
                         pass
                 dropped += len(files) - len(kept)
                 files = kept
+            if 0 < fraction < 1 and files:
+                keep = max(1, int(round(len(files) * fraction)))
+                idx = np.random.default_rng(seed).choice(len(files), size=keep, replace=False)
+                files = [files[i] for i in sorted(idx)]
             if files and weight > 0:
                 self.groups.append((path, weight, files))
         if dropped:

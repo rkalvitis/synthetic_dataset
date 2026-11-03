@@ -1,0 +1,23 @@
+# Full 20k run on the Windows GPU machine, with backgrounds and output on the external SSD (E:\synth).
+# Usage: python -m popsynth.cli generate -c configs/e_synth_20k.yaml
+_base: default.yaml
+splat:
+  path: assets/popillia_try32.ply   # LichtFeld Studio export (D:\datasets\popillia, 433k gaussians), 2026-09-22
+  up: [-0.096, -0.106, 0.99]       # smallest principal axis of this model; sign checked visually (elevation 90 = back)
+  # Alternative (superspl.at ex13, 848k gaussians, darker/softer, no pin floaters):
+  #   --set splat.path=assets/popillia_ex13.ply --set splat.up=[-0.336,-0.067,-0.939]
+render:
+  num_sprites: 2000          # distinct viewpoints, re-used across backgrounds
+backgrounds:
+  # fraction = share of the folder's files used (seeded subset); weight = probability of picking the folder.
+  # Weights are proportional to the resulting file counts (3062 / 2047 / ~2550), so every selected
+  # photo is equally likely to appear.
+  dirs:
+    - {path: E:/synth/data/backgrounds/inat_hostplants, fraction: 1.0,  weight: 0.40}
+    - {path: E:/synth/data/backgrounds/flowers102,      fraction: 0.25, weight: 0.27}
+    - {path: E:/synth/data/backgrounds/places365,       fraction: 0.5,  weight: 0.33}
+  min_size: 480            # flowers102 and some places365 photos are ~500 px on the short side
+compose:
+  num_images: 20000
+output:
+  dir: E:/synth/outputs/dataset_20k
