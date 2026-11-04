@@ -43,7 +43,7 @@ class OccluderBank:
             if not os.path.isdir(path):
                 print(f"warning: occluder dir not found, skipped: {path} (see scripts/download_leaf_occluders.py)")
                 continue
-            self.files += sorted(os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(EXTS))
+            self.files += sorted(os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(EXTS) and not f.startswith("._"))
         from collections import OrderedDict
         self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()     # uint8 RGBA, LRU, byte-capped
 

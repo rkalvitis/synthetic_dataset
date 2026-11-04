@@ -113,7 +113,7 @@ class BackgroundPool:
             if not os.path.isdir(path):
                 print(f"warning: background dir not found, skipped: {path} (see scripts/download_*backgrounds.py)")
                 continue
-            files = sorted(os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(EXTS))
+            files = sorted(os.path.join(r, f) for r, _, fs in os.walk(path) for f in fs if f.lower().endswith(EXTS) and not f.startswith("._"))
             if min_size > 1:   # drop files whose shorter side is too small (header read only, no decode)
                 from PIL import Image
                 kept = []

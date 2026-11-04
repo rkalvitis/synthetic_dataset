@@ -1,9 +1,10 @@
-# Full 40k run on the Windows GPU machine with every variation enabled and every background photo in use.
-# Backgrounds, leaf cutouts and output live on the external SSD (E:\synth).
+# Full 40k run (dataset v2) on the Windows GPU machine with every variation enabled and every background photo in use.
+# Inputs (backgrounds, leaf cutouts) stay on the external SSD under E:\synth\data; the output goes directly into E:\synth_v2 (no subfolder).
 # Usage:  python -m popsynth.cli generate -c configs/e_synth_40k.yaml
-#         python -m popsynth.cli stats    -c configs/e_synth_40k.yaml      # plots afterwards
+#         python -m popsynth.cli stats    -c configs/e_synth_40k.yaml      # plots afterwards (needs matplotlib)
 # Prerequisites on E:\synth\data:  backgrounds/{inat_hostplants,flowers102,places365} and
-#         occluders/flavia (python scripts/download_leaf_occluders.py --out E:/synth/data/occluders/flavia).
+#         occluders/flavia (python scripts/download_leaf_occluders.py --out E:/synth/data/occluders/flavia
+#         --raw E:/synth/data/_raw/flavia); without the cutouts only background-patch occluders are used.
 _base: default.yaml
 
 splat:
@@ -122,7 +123,7 @@ resources:
   occluder_cache_gb: 0.5
 
 output:
-  dir: E:/synth/outputs/dataset_40k
+  dir: E:/synth_v2
   image_format: png
   write_masks: true
   write_yolo: true
