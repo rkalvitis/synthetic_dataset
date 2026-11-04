@@ -124,3 +124,24 @@ def fixed_camera(width, height, *, up=(0, 0, 1), object_radius=1.0, elevation_de
     return CameraSample(look_at(dist * direction, np.zeros(3), upv, roll_deg), intrinsics(width, height, fov_deg),
                         width, height, float(elevation_deg), float(azimuth_deg), float(roll_deg), float(fov_deg),
                         float(dist), float(fill))
+
+
+def projected_extent(means: np.ndarray, scales: np.ndarray, viewmat: np.ndarray, K: np.ndarray,
+                     sigmas: float = 2.0) -> tuple[float, float, float, float]:
+    """Image-space bounding box (x0, y0, x1, y1) in pixels of the gaussians seen by the camera: every centre
+    projected, padded by `sigmas` times its largest scale projected at its depth. Cheap (one matmul), used to
+    pick the frame size that makes the beetle a wanted number of pixels wide (render.size_mode: object)."""
+    M = np.asarray(viewmat, np.float64)
+    pc = means.astype(np.float64) @ M[:3, :3].T + M[:3, 3]
+    z = np.maximum(pc[:, 2], 1e-6)
+    f = float(K[0, 0])
+    u = f * pc[:, 0] / z + float(K[0, 2])
+    v = f * pc[:, 1] / z + float(K[1, 2])
+    r = sigmas * scales.max(1).astype(np.float64) * f / z
+    return float((u - r).min()), float((v - r).min()), float((u + r).max()), float((v + r).max())
+
+
+def resized(cam: CameraSample, width: int, height: int) -> CameraSample:
+    """Same camera pose and fov on a different frame size (intrinsics scale with the frame)."""
+    from dataclasses import replace
+    return replace(cam, K=intrinsics(width, height, cam.fov_deg), width=width, height=height)

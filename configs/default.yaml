@@ -22,8 +22,17 @@ render:
   size: 2048               # sprite resolution (square); sprites are scaled down when composited, never up
   supersample: 2           # render at size*supersample and area-downsample (sharper, no aliasing)
   antialiased: true        # Mip-Splatting style opacity compensation for gaussians smaller than a pixel
-  num_sprites: 24          # distinct rendered views. Full run: ~2000 (sprites are re-used with different backgrounds)
+  num_sprites: 24          # distinct rendered views. Full run: 2000-5000 (sprites are re-used with different backgrounds)
   val_fraction: 0.15       # these sprites are reserved for the validation split (unseen viewpoints)
+  # How big the beetle is in the final image:
+  #   object = decided HERE per sprite: the beetle's longest side is drawn uniformly from object_size (fraction of
+  #            the short side of compose.image_size) and the frame size / camera distance are chosen so the
+  #            render has exactly that many pixels; compose pastes the sprite 1:1 (no resampling). Small beetles
+  #            are still rendered with >= min_render_px samples and area-downsampled.
+  #   fixed  = every sprite is rendered at `size` px and compose rescales it to compose.object_size.
+  size_mode: object
+  object_size: [0.12, 0.85]
+  min_render_px: 1024
   camera:
     elevation_deg: [0, 90]     # -90 = from below, 0 = side view, 90 = top-down. The underside of the splat is
                                # reconstructed less well, so views from below are off by default
@@ -53,12 +62,70 @@ compose:
   val_fraction: 0.15
   positive_fraction: 0.5   # the rest are background-only negatives ("background" class)
   objects_per_image: [1, 3]   # beetles per positive image (uniform in this range); [1, 1] for exactly one
-  object_size: [0.12, 0.85]   # beetle's longest side as a fraction of the shorter image side (distance)
+  object_size: [0.12, 0.85]   # only for render.size_mode: fixed (with size_mode: object the size comes from the sprite)
   min_visible: 1.0            # fraction of the object that must stay inside the frame (1.0 = never cut by the edge)
   color_match: [0.0, 0.25]    # strength of pulling the beetle's tint/brightness toward the background (keep low)
   edge_blur_px: [0.3, 1.0]
   defocus: {prob: 0.15, sigma_px: [0.4, 1.0]}
   shadow: {prob: 0.8, strength: [0.2, 0.6], blur: [0.03, 0.12], offset: [0.0, 0.08]}
+  # Where beetles land in the frame (check with `popsynth stats`, centre heatmap):
+  #   placement: uniform        = box uniformly over all positions where the whole beetle fits; dataset-wide the
+  #                               centres still favour the middle, because a big beetle only fits there
+  #              uniform_center = centre drawn uniformly over the whole frame, beetle shifted inside only as far
+  #                               as needed: flat centre distribution for small beetles, big ones touch the edges
+  #   center_sigma: a number overrides both (normal distribution around the centre, hand-held-photo look)
+  placement: uniform
+  center_sigma: null
+  # Label box for partly hidden beetles: full = the whole body (amodal, hidden part included; default),
+  # visible = tight around the visible pixels. Both are always stored in the metadata.
+  box_mode: full
+  # Beetle (partly) behind a leaf or another foreground object. Applied to `prob` of the positive images,
+  # `count` occluders each; every occluder targets a random beetle and is placed so that about `cover`
+  # of that beetle is hidden (achieved value recorded as cover_achieved / occluded_by_occluder_frac).
+  # sources: leaf = RGBA cutouts from `dirs` (scripts/download_leaf_occluders.py -> data/occluders/flavia),
+  #          background = a leaf-shaped patch cut from the same background photo (needs no extra data;
+  #          used alone when no cutout folder exists).
+  occlusion:
+    prob: 0.3
+    count: [1, 2]
+    cover: [0.1, 0.6]            # target hidden fraction of the beetle
+    max_hidden: 0.8              # never hide more than this of any beetle
+    size: [0.6, 1.8]             # occluder long side relative to the beetle's long side
+    blur_sigma_px: [0.8, 3.0]    # foreground out of focus (a leaf closer than the focus plane is never sharp)
+    brightness: [0.6, 0.95]      # leaves in front are in shadow more often than not
+    contrast: [0.75, 1.0]        # flatter than the in-focus plane
+    match_color: [0.4, 0.8]      # pull the occluder's tint/brightness toward the spot it covers (blends it in)
+    shadow: {strength: [0.15, 0.35], blur: [0.03, 0.08], offset: [0.0, 0.05]}   # soft contact shadow under it
+    rotate_deg: [0, 360]
+    sources: {leaf: 0.5, background: 0.5}
+    dirs:
+      - data/occluders/flavia
+
+# Two independent augmentation stages before compositing, so the beetle and the background do not always
+# share tint / exposure / sharpness (the whole-image `lighting` and `camera_effects` come afterwards).
+# Every key is optional; a parameter is only applied if its range is present.
+background_aug:
+  prob: 0.7
+  brightness: [0.75, 1.25]
+  contrast: [0.8, 1.2]
+  saturation: [0.7, 1.3]
+  hue_deg: [-12, 12]
+  gamma: [0.8, 1.25]
+  rotate_deg: [-20, 20]          # reflected borders, no black corners
+  vflip: 0.1
+  blur_sigma_px: [0.0, 1.2]      # slightly soft background (shallow depth of field)
+  grayscale_prob: 0.02
+sprite_aug:
+  prob: 0.7
+  brightness: [0.8, 1.2]
+  contrast: [0.85, 1.15]
+  saturation: [0.8, 1.25]
+  hue_deg: [-8, 8]               # keep the metallic green/copper look, small shifts only
+  gamma: [0.85, 1.2]
+  hflip: 0.5                     # mirrored beetle (bilateral symmetry)
+  aspect: [0.92, 1.08]           # slight anisotropic scale
+  specular: {prob: 0.25, strength: [0.2, 0.6]}   # extra sun glint on the elytra
+  blur_sigma_px: [0.0, 0.6]
 
 lighting:
   # sampled per image, applied to the whole composite. weights are relative probabilities.
@@ -86,6 +153,15 @@ camera_effects:
             lowres_prob: 0.4, lowres_factor: [2.5, 5.0], haze_prob: 0.3, haze: [0.25, 0.5],
             exposure_fault_prob: 0.4, overexposure: [1.8, 2.8], underexposure: [0.2, 0.4],
             noise: [0.02, 0.08], jpeg_quality: [20, 55]}
+
+resources:
+  # RAM budget of the generator process. max_ram_gb is a hard cap on Windows (job object: allocations beyond
+  # it fail with MemoryError instead of swapping) and a watchdog everywhere (aborts with a message).
+  # The caches are what actually grows with the sprite count: decoded sprites are kept as uint8 RGBA in an
+  # LRU cache of at most sprite_cache_gb; everything else is per-image and small (< 1 GB at 1024 px).
+  max_ram_gb: 16
+  sprite_cache_gb: 4         # ~700 of 2048 px sprites; the rest are re-read from PNG when drawn (~20 ms each)
+  occluder_cache_gb: 0.5
 
 output:
   dir: outputs/dataset

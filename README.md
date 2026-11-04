@@ -27,6 +27,13 @@ data/backgrounds/**      --(2) compose + augment-->  <out>/images/{train,val}/{p
    elevation, azimuth, in-plane roll, field of view and frame fill. Distance follows from fov and
    fill, so a narrow fov + far camera gives a flat telephoto look and a wide fov + close camera gives
    macro perspective. Each view is rendered with transparent background and saved as an RGBA sprite.
+   **Size.** With `render.size_mode: object` (default) the beetle's final pixel size is decided here, per
+   sprite: its longest side is drawn uniformly from `render.object_size` (fraction of the short side of
+   `compose.image_size`), the projected extent of the gaussians is measured, and the frame size / camera
+   distance are set so the render has exactly that many pixels (small beetles are rendered at >=
+   `min_render_px` and area-downsampled). The compose stage then pastes the sprite 1:1, so distance,
+   perspective and resolution all come from the render and never from resampling. `size_mode: fixed` is the
+   old behaviour (every sprite at `render.size`, rescaled by compose to `compose.object_size`).
    Two renderers share one interface:
    - `gsplat` (CUDA, fast, ~ms per frame) - use on the GPU machine.
    - `torch` (`popsynth/render/torch_raster.py`, pure PyTorch, CPU / Apple MPS / CUDA, exact but
@@ -39,6 +46,27 @@ data/backgrounds/**      --(2) compose + augment-->  <out>/images/{train,val}/{p
    applied to the whole image, followed by camera imperfections drawn from a quality tier (clean, mild
    or clearly bad: motion blur, defocus, low resolution, haze, bad exposure, noise, heavy JPEG), because
    real photos are never perfect. Negatives go through the same steps without a sprite.
+
+   Three more sources of variation sit inside this stage:
+   - **Two separate augmentations** (`background_aug`, `sprite_aug`): before compositing, the background
+     crop and each beetle sprite get their *own* independent photometric/geometric jitter (brightness,
+     contrast, saturation, hue, gamma; background: rotation, flip, blur, grayscale; beetle: mirror,
+     aspect, specular glint, blur), so the beetle does not always share the background's tint, exposure
+     and sharpness. The whole-image lighting and camera effects come on top.
+   - **Beetle behind a leaf** (`compose.occlusion`): after the beetles are pasted, one or two foreground
+     occluders are placed over a random beetle so that a target fraction of it is hidden. Occluders are
+     either RGBA leaf cutouts (`scripts/download_leaf_occluders.py` converts the Flavia leaf scans) or a
+     leaf-shaped patch cut from the same background photo at the same texture scale (needs no extra data,
+     used alone if no cutouts exist, works on any background type). Occluders are defocused (closer than the
+     focus plane), slightly darkened and flattened, colour-matched to the spot they cover, and cast a soft
+     contact shadow, so they do not look like pasted stickers. The hidden fraction, source
+     and the visible box are recorded per beetle; `compose.box_mode` chooses whether the label box covers
+     the whole body (default) or only the visible pixels.
+   - **Placement** (`compose.placement`): `uniform` places the box uniformly over every position where the
+     whole beetle fits (big beetles then necessarily sit near the middle); `uniform_center` draws the centre
+     uniformly over the whole frame and shifts the beetle inside only as far as needed, which gives a flat
+     centre distribution. `compose.center_sigma` instead clusters beetles around the centre like hand-held
+     photos. `popsynth stats` plots where beetles actually land.
 
 All randomness derives from `seed` plus the image index, so a dataset can be regenerated or
 extended exactly. Validation sprites (`render.val_fraction`) are never used in training images, so
@@ -92,6 +120,15 @@ sprite on a 4060 Ti, still fine for a few hundred sprites). The full run, about 
 python -m popsynth.cli generate --set render.num_sprites=2000 --set compose.num_images=20000 -o outputs/dataset_20k
 ```
 
+**RAM budget.** `resources.max_ram_gb` (16 in `default.yaml` and `e_synth_20k.yaml`) is a hard cap on Windows
+(a job object: an allocation beyond it raises `MemoryError` instead of swapping) and a watchdog on every platform
+(the compose loop aborts with a message if the process grows past it). What actually grows with the sprite count
+is the decoded-sprite cache, now an LRU of uint8 sprites limited to `resources.sprite_cache_gb` (4 GB default, about
+700 sprites of 2048 px; the rest are re-read from PNG, ~20 ms each) plus `occluder_cache_gb` for leaf cutouts.
+Everything else is per image and small: a 1024 px compose run peaks well under 2 GB, and the render stage keeps
+only one frame on the CPU. Peak RAM and cache hit rate are printed at the end of each stage.
+`popsynth info` has no effect on it; the limit is applied when `render-sprites`, `compose` or `generate` start.
+
 Put the splat PLY in `assets/` (git-ignored) and fetch backgrounds:
 
 ```bash
@@ -119,9 +156,12 @@ popsynth info                                   # splat stats, principal axes, r
 popsynth generate                               # 24 sprites + 10 images at full quality (2048 px sprites, 1024 px PNGs)
 popsynth generate -c configs/mac_preview.yaml   # same pipeline, laptop-sized (1024 px sprites, 640 px JPGs, a few minutes)
 popsynth preview -n 10                          # contact sheet with boxes -> outputs/dataset/preview.jpg
+popsynth stats                                  # size distribution, centre heatmap, per-pixel density -> outputs/dataset/stats/
+python scripts/download_leaf_occluders.py       # Flavia leaf scans (~1 GB) -> data/occluders/flavia/*.png cutouts
 
-# full dataset on the GPU machine
-popsynth generate --set render.num_sprites=2000 --set compose.num_images=10000 -o outputs/popillia_10k
+# full dataset on the GPU machine (40k images, 5000 sprites, every variation, all backgrounds, 16 GB RAM cap)
+popsynth generate -c configs/e_synth_40k.yaml
+popsynth stats    -c configs/e_synth_40k.yaml
 
 # re-composite with different backgrounds / augmentation without re-rendering
 popsynth compose -o outputs/popillia_10k --set compose.image_size=[224,224] --set lighting.night.weight=0.3
@@ -138,14 +178,20 @@ Key knobs:
 |---|---|
 | `splat.up` | dorsal direction of the beetle in splat coordinates (so elevation 90 = top-down) |
 | `render.camera.elevation_deg / fov_deg / fill` | viewpoint distribution, perspective, framing |
-| `render.num_sprites` | number of distinct rendered views (re-used across backgrounds) |
+| `render.num_sprites` | number of distinct rendered views (re-used across backgrounds); 5000 in `configs/e_synth_40k.yaml` |
+| `render.size_mode`, `render.object_size`, `render.min_render_px` | `object` (default): beetle pixel size drawn uniformly per sprite and produced by the camera, pasted 1:1; `fixed`: constant sprite size, rescaled at compose time |
 | `render.size`, `render.supersample`, `render.antialiased` | sprite resolution, supersampling factor and Mip-Splatting opacity compensation (2048 / 2 / on by default = highest quality; use `configs/mac_preview.yaml` on a laptop) |
 | `compose.image_size` | output image size; keep it above the CNN input size and resize at training time |
-| `compose.object_size` | beetle size as fraction of the shorter image side (= distance) |
+| `compose.object_size` | beetle size as fraction of the shorter image side; only used with `render.size_mode: fixed` |
 | `compose.positive_fraction` | share of images containing a beetle |
 | `compose.objects_per_image` | `[1, 3]` to paste several beetles (detection) |
 | `lighting.*` | per-mode exposure, white balance, contrast, saturation, noise, vignette, flash |
 | `camera_effects.tiers` | quality tiers (clean / mild / bad) with per-effect probabilities: motion blur, defocus, low resolution, haze, over/under-exposure, noise, JPEG |
+| `background_aug`, `sprite_aug` | the two independent pre-compositing augmentations (`prob` + a range per parameter; a parameter is skipped if its range is absent) |
+| `compose.occlusion` | beetle behind a leaf: `prob`, `count`, `cover` (target hidden fraction), `max_hidden`, `size`, `blur_sigma_px`, `brightness`, `contrast`, `match_color` (blend toward the covered spot), `shadow`, `sources {leaf, background}`, `dirs` (cutout folders) |
+| `compose.placement`, `compose.center_sigma` | `uniform` (box uniform where it fits) or `uniform_center` (flat centre distribution); `center_sigma` = std of a normal distribution around the image centre instead |
+| `compose.box_mode` | `full` (box covers the whole beetle, hidden parts included) or `visible` (tight around the visible pixels) |
+| `resources.max_ram_gb`, `sprite_cache_gb`, `occluder_cache_gb` | RAM cap of the process (hard on Windows, watchdog elsewhere) and the sizes of the decoded sprite / leaf-cutout caches |
 
 ## Output format
 
@@ -159,6 +205,7 @@ Key knobs:
 <out>/objects.csv                             one row per beetle: box, pose, size, compositing parameters
 <out>/summary.json                            counts and distributions
 <out>/sprites/sprites.jsonl                   camera of every rendered sprite
+<out>/stats/*.png, stats.json                 `popsynth stats`: size_distribution, center_heatmap, pixel_density, occlusion
 ```
 
 `dataset.json` is loadable by any COCO tool (pycocotools, torchvision `CocoDetection`, Ultralytics, FiftyOne);
@@ -177,6 +224,8 @@ Per image (`images.csv`, `metadata.jsonl`, `dataset.json[images][i].metadata`):
 | `bg_crop_px`, `bg_crop_scale`, `bg_hflip` | crop window in the source photo, crop size fraction, flip |
 | `lighting`, `exposure`, `contrast`, `saturation`, `noise`, `flash` | lighting mode (day/overcast/dusk/night) and its parameters |
 | `quality_tier`, `effects` | clean/mild/bad, list of imperfections applied |
+| `bg_aug`, `bg_brightness`, `bg_contrast`, `bg_saturation`, `bg_hue_deg`, `bg_gamma`, `bg_rotate_deg`, `bg_vflip`, `bg_blur_sigma_px`, `bg_grayscale` | background augmentation: list of applied parameters and their values |
+| `num_occluders`, `occluders` | foreground occluders in this image: per occluder `occluder` (leaf/background), `occluder_file`, `target_object`, `cover_target`, `cover_achieved`, `occluder_px`, `occluder_rotate_deg`, `occluder_blur_sigma`, `occluder_brightness`, `occluder_contrast`, `occluder_match_color` |
 | `motion_blur_px`, `defocus_sigma`, `lowres_factor`, `haze`, `overexposure`, `underexposure`, `sensor_noise`, `jpeg_quality` | parameter of each applied imperfection (absent if not applied) |
 
 Per beetle (`objects.csv`, `metadata.jsonl[objects]`, `dataset.json[annotations][i]`):
@@ -185,7 +234,9 @@ Per beetle (`objects.csv`, `metadata.jsonl[objects]`, `dataset.json[annotations]
 |---|---|
 | `image_name`, `object_id` | which image, index within it |
 | `bbox_xyxy`, `bbox_cxcywh_norm`, `bbox_w_px`, `bbox_h_px`, `bbox_area_frac` | tight box around visible beetle pixels (mask > 0.5), in pixels and normalised |
-| `mask_area_px`, `visible_frac`, `occluded_frac` | beetle pixel count, fraction of the sprite inside the frame (1.0 = whole beetle visible), fraction of its pixels hidden behind a beetle pasted later (box still covers the full body) |
+| `mask_area_px`, `visible_frac`, `occluded_frac` | beetle pixel count, fraction of the sprite inside the frame (1.0 = whole beetle visible), fraction of its pixels hidden (by a beetle pasted later or by an occluder; with `box_mode: full` the box still covers the full body) |
+| `occluded_by_beetle_frac`, `occluded_by_occluder_frac`, `visible_area_px`, `bbox_visible_xyxy` | split of the hidden fraction, visible pixel count and the tight box around the visible pixels |
+| `sprite_aug`, `aug_brightness`, `aug_contrast`, `aug_saturation`, `aug_hue_deg`, `aug_gamma`, `aug_hflip`, `aug_aspect`, `aug_specular`, `aug_blur_sigma_px` | beetle augmentation: list of applied parameters and their values |
 | `object_size_frac`, `object_px` | beetle longest side as fraction of the short image side, and in px |
 | `elevation_deg`, `azimuth_deg`, `roll_deg`, `fov_deg`, `camera_distance` | 3D view: elevation above the beetle's horizon, heading, in-plane rotation, lens field of view, camera distance (model units) |
 | `sprite`, `sprite_index` | which rendered sprite was pasted (details in `sprites/sprites.jsonl`) |
@@ -211,8 +262,24 @@ but needs minutes per sprite, so use `configs/mac_preview.yaml` for local checks
 
 `popsynth demo -c configs/mac_preview.yaml` writes `outputs/demo/slide_NN_*.jpg`, one factor varied per
 slide on the same background (distance, lighting, viewpoint, rotation, partially outside, perspective,
-compositing effects, imperfections, backgrounds, multiple beetles, negatives), plus the individual images
+compositing effects, imperfections, backgrounds, multiple beetles, negatives, occlusion, background
+augmentation, sprite augmentation), plus the individual images
 as PNG in `outputs/demo/NN_*/`.
+
+## Dataset statistics
+
+`popsynth stats -o <out>` reads `metadata.jsonl` and the masks and writes to `<out>/stats/`:
+
+| File | What it shows |
+|---|---|
+| `size_distribution.png` | histograms of the beetle size: longest side / short image side, in pixels, box area fraction (median and 5-95 % in the titles) |
+| `center_heatmap.png` | where the beetle box centres fall (12x12 cells, % of beetles; middle third / middle half outlined) and a radial profile: how often the beetle is in the centre vs. near the edges |
+| `pixel_density.png` | per pixel, the % of positive images in which that pixel is beetle (from the masks) and inside a box |
+| `occlusion.png` | hidden fraction per beetle |
+| `stats.json` | the numbers behind the plots (quantiles, centre fractions, density means) |
+
+`summary.json` also carries `occluded_frac`, `center_in_middle_third`, `center_in_middle_half`, `center_x/y`,
+`images_with_occluder`, `occluder_source`, `background_aug` and `sprite_aug` counts.
 
 ## Tests
 

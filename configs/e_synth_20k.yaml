@@ -19,5 +19,9 @@ backgrounds:
   min_size: 480            # flowers102 and some places365 photos are ~500 px on the short side
 compose:
   num_images: 20000
+resources:
+  max_ram_gb: 16             # hard cap (Windows job object) + watchdog; see default.yaml
+  sprite_cache_gb: 4
+  occluder_cache_gb: 0.5
 output:
   dir: E:/synth/outputs/dataset_20k

@@ -163,3 +163,104 @@ def apply_camera_effects(img: np.ndarray, rng: np.random.Generator, cfg: dict) -
         out = cv2.cvtColor(cv2.imdecode(buf, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB).astype(np.float32) / 255
         meta["jpeg_quality"] = q
     return np.ascontiguousarray(out), meta
+
+
+# ----------------------------------------------------------------------------- separate augmentations
+# Two independent augmentation stages run BEFORE compositing: one on the background crop and one on the
+# beetle sprite.  They decorrelate the two layers (the beetle does not always share the background's tint,
+# exposure and sharpness), on top of the whole-image lighting + camera effects applied afterwards.
+
+def _color_jitter(img: np.ndarray, rng: np.random.Generator, c: dict, alpha: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+    """Photometric jitter of float RGB [0,1]: brightness, contrast, saturation, hue rotation, gamma, grayscale.
+    Each parameter is applied only if its range is configured. Returns (img, meta of the drawn values)."""
+    meta = {}
+    out = img.astype(np.float32, copy=True)
+    if "brightness" in c:
+        b = _u(rng, c["brightness"]); out = out * b; meta["brightness"] = round(b, 3)
+    if "contrast" in c:
+        k = _u(rng, c["contrast"])
+        mean = float((out * alpha[..., None]).sum() / max(alpha.sum() * 3, 1)) if alpha is not None else float(out.mean())
+        out = (out - mean) * k + mean; meta["contrast"] = round(k, 3)
+    if "gamma" in c:
+        g = _u(rng, c["gamma"]); out = np.power(np.clip(out, 0, 1), g); meta["gamma"] = round(g, 3)
+    hue = _u(rng, c["hue_deg"]) if "hue_deg" in c else 0.0
+    sat = _u(rng, c["saturation"]) if "saturation" in c else 1.0
+    if abs(hue) > 0.01 or abs(sat - 1) > 1e-3:
+        hsv = cv2.cvtColor(np.clip(np.ascontiguousarray(out), 0, 1), cv2.COLOR_RGB2HSV)   # H in [0,360)
+        hsv[..., 0] = (hsv[..., 0] + hue) % 360.0
+        hsv[..., 1] = np.clip(hsv[..., 1] * sat, 0, 1)
+        out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        if "hue_deg" in c:
+            meta["hue_deg"] = round(hue, 1)
+        if "saturation" in c:
+            meta["saturation"] = round(sat, 3)
+    if rng.random() < c.get("grayscale_prob", 0.0):
+        gray = out @ np.array([0.299, 0.587, 0.114], np.float32)
+        out = np.repeat(gray[..., None], 3, 2); meta["grayscale"] = True
+    return np.clip(out, 0, 1).astype(np.float32), meta
+
+
+def augment_background(img: np.ndarray, rng: np.random.Generator, cfg: dict | None) -> tuple[np.ndarray, dict]:
+    """Background-only augmentation (float RGB [0,1] crop -> same size).  cfg: prob + any of
+    brightness, contrast, saturation, hue_deg, gamma, grayscale_prob, blur_sigma_px, rotate_deg, vflip.
+    Rotation uses reflected borders so no black corners appear.  Meta keys are prefixed with 'bg_'."""
+    if not cfg or rng.random() >= float(cfg.get("prob", 0.0)):
+        return img, {"bg_aug": []}
+    out, m = _color_jitter(img, rng, cfg)
+    H, W = out.shape[:2]
+    if "rotate_deg" in cfg:
+        deg = _u(rng, cfg["rotate_deg"])
+        if abs(deg) > 0.05:
+            M = cv2.getRotationMatrix2D((W / 2, H / 2), deg, 1.0)
+            out = cv2.warpAffine(np.ascontiguousarray(out), M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+            m["rotate_deg"] = round(deg, 1)
+    if rng.random() < cfg.get("vflip", 0.0):
+        out = np.ascontiguousarray(out[::-1]); m["vflip"] = True
+    if "blur_sigma_px" in cfg:
+        s = _u(rng, cfg["blur_sigma_px"])
+        if s > 0.05:
+            out = _gauss(out, s); m["blur_sigma_px"] = round(s, 2)
+    meta = {f"bg_{k}": v for k, v in m.items()}
+    meta["bg_aug"] = sorted(m)
+    return np.ascontiguousarray(out), meta
+
+
+def augment_sprite(rgb: np.ndarray, alpha: np.ndarray, rng: np.random.Generator, cfg: dict | None
+                   ) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Beetle-only augmentation of an RGBA sprite (float [0,1]).  cfg: prob + any of brightness, contrast,
+    saturation, hue_deg, gamma, hflip (mirror: the beetle is bilaterally symmetric), aspect (anisotropic
+    scale range, e.g. [0.9, 1.1]), blur_sigma_px, specular (prob of an extra highlight: {prob, strength}).
+    Never modifies the inputs. Meta keys are prefixed with 'aug_'."""
+    if not cfg or rng.random() >= float(cfg.get("prob", 0.0)):
+        return rgb, alpha, {"sprite_aug": []}
+    out, m = _color_jitter(rgb, rng, cfg, alpha)
+    a = alpha.astype(np.float32, copy=True)
+    if rng.random() < cfg.get("hflip", 0.0):
+        out, a = out[:, ::-1], a[:, ::-1]; m["hflip"] = True
+    if "aspect" in cfg:
+        sx, sy = _u(rng, cfg["aspect"]), _u(rng, cfg["aspect"])
+        h, w = a.shape
+        nw, nh = max(2, int(round(w * sx))), max(2, int(round(h * sy)))
+        out = cv2.resize(np.ascontiguousarray(out), (nw, nh), interpolation=cv2.INTER_LINEAR)
+        a = cv2.resize(np.ascontiguousarray(a), (nw, nh), interpolation=cv2.INTER_LINEAR)
+        m["aspect"] = [round(sx, 3), round(sy, 3)]
+    sp = cfg.get("specular") or {}
+    if rng.random() < sp.get("prob", 0.0):
+        # one soft elliptical highlight somewhere on the body (sun glint on the elytra)
+        h, w = a.shape
+        ys, xs = np.where(a > 0.5)
+        if len(ys):
+            i = int(rng.integers(len(ys)))
+            cy, cx = ys[i], xs[i]
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            r = max(w, h) * _u(rng, (0.04, 0.12))
+            g = np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * r * r)))
+            s = _u(rng, sp.get("strength", (0.2, 0.6)))
+            out = np.clip(out + (s * g * a)[..., None], 0, 1); m["specular"] = round(s, 3)
+    if "blur_sigma_px" in cfg:
+        s = _u(rng, cfg["blur_sigma_px"])
+        if s > 0.05:
+            out = _gauss(out, s); a = _gauss(a, s); m["blur_sigma_px"] = round(s, 2)
+    meta = {f"aug_{k}": v for k, v in m.items()}
+    meta["sprite_aug"] = sorted(m)
+    return np.ascontiguousarray(out), np.ascontiguousarray(a), meta

@@ -32,6 +32,9 @@ IMAGE_COLUMNS = [
     "lighting", "exposure", "contrast", "saturation", "noise", "flash",
     "quality_tier", "effects", "motion_blur_px", "defocus_sigma", "lowres_factor", "haze",
     "overexposure", "underexposure", "sensor_noise", "jpeg_quality", "gaussian_blur_sigma",
+    "bg_aug", "bg_brightness", "bg_contrast", "bg_saturation", "bg_hue_deg", "bg_gamma", "bg_rotate_deg",
+    "bg_vflip", "bg_blur_sigma_px", "bg_grayscale",
+    "num_occluders", "occluders",
     "boxes_xyxy", "boxes_cxcywh_norm",
 ]
 OBJECT_COLUMNS = [
@@ -39,6 +42,9 @@ OBJECT_COLUMNS = [
     "bbox_area_frac", "mask_area_px", "visible_frac", "occluded_frac", "object_size_frac", "object_px",
     "sprite", "sprite_index", "elevation_deg", "azimuth_deg", "roll_deg", "fov_deg", "camera_distance",
     "color_match", "defocus_sigma", "shadow_strength", "shadow_blur_px",
+    "occluded_by_beetle_frac", "occluded_by_occluder_frac", "visible_area_px", "bbox_visible_xyxy",
+    "sprite_aug", "aug_brightness", "aug_contrast", "aug_saturation", "aug_hue_deg", "aug_gamma", "aug_hflip",
+    "aug_aspect", "aug_specular", "aug_blur_sigma_px",
 ]
 
 
@@ -213,4 +219,16 @@ def summarize(recs: list[dict]) -> dict:
         s["elevation_deg"] = hist([o["elevation_deg"] for o in objs], [-90, 0, 15, 30, 45, 60, 75, 90])
         s["roll_deg"] = hist([o["roll_deg"] for o in objs], [-180, -120, -60, 0, 60, 120, 180])
         s["visible_frac"] = hist([o["visible_frac"] for o in objs], [0, 0.25, 0.5, 0.75, 0.999, 1.001])
+        s["occluded_frac"] = hist([o.get("occluded_frac", 0.0) for o in objs], [0, 0.001, 0.1, 0.25, 0.5, 0.75, 1.001])
+        # where the beetles are: fraction of box centres inside the central third / central half of the frame
+        cx = np.array([o["bbox_cxcywh_norm"][0] for o in objs]); cy = np.array([o["bbox_cxcywh_norm"][1] for o in objs])
+        s["center_in_middle_third"] = round(float(((abs(cx - 0.5) < 1 / 6) & (abs(cy - 0.5) < 1 / 6)).mean()), 3)
+        s["center_in_middle_half"] = round(float(((abs(cx - 0.5) < 0.25) & (abs(cy - 0.5) < 0.25)).mean()), 3)
+        s["center_x"] = hist(cx, [0, 0.2, 0.4, 0.6, 0.8, 1.0]); s["center_y"] = hist(cy, [0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    pos = [r for r in recs if r.get("num_objects")]
+    if pos:
+        s["images_with_occluder"] = sum(1 for r in pos if r.get("num_occluders"))
+        s["occluder_source"] = dict(sorted(Counter(o.get("occluder") for r in pos for o in r.get("occluders") or []).items()))
+    s["background_aug"] = dict(sorted(Counter(e for r in recs for e in r.get("bg_aug") or []).items()))
+    s["sprite_aug"] = dict(sorted(Counter(e for o in objs for e in o.get("sprite_aug") or []).items()))
     return s

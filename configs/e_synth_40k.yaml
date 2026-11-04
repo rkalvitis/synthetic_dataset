@@ -1,0 +1,128 @@
+# Full 40k run on the Windows GPU machine with every variation enabled and every background photo in use.
+# Backgrounds, leaf cutouts and output live on the external SSD (E:\synth).
+# Usage:  python -m popsynth.cli generate -c configs/e_synth_40k.yaml
+#         python -m popsynth.cli stats    -c configs/e_synth_40k.yaml      # plots afterwards
+# Prerequisites on E:\synth\data:  backgrounds/{inat_hostplants,flowers102,places365} and
+#         occluders/flavia (python scripts/download_leaf_occluders.py --out E:/synth/data/occluders/flavia).
+_base: default.yaml
+
+splat:
+  path: assets/popillia_try32.ply   # LichtFeld Studio export (D:\datasets\popillia, 433k gaussians), 2026-09-22
+  up: [-0.096, -0.106, 0.99]       # smallest principal axis of this model; sign checked visually (elevation 90 = back)
+
+render:
+  num_sprites: 5000          # distinct viewpoints (each one is re-used ~8x with different backgrounds/augmentations)
+  val_fraction: 0.15
+  size_mode: object          # beetle pixel size decided per sprite by the camera (uniform in object_size), pasted 1:1
+  object_size: [0.12, 0.85]  # longest side as a fraction of the 1024 px short side: 123 .. 870 px, uniform
+  min_render_px: 1024        # small beetles are rendered at >= 1024 px and area-downsampled (quality)
+  supersample: 2
+  antialiased: true
+  camera:                    # full viewpoint range: side view to top-down, any heading, any in-plane rotation,
+    elevation_deg: [0, 90]   # telephoto to close-up perspective
+    azimuth_deg: [0, 360]
+    roll_deg: [-180, 180]
+    fov_deg: [25, 70]
+    fill: [0.75, 0.92]
+
+backgrounds:
+  # every photo of every folder (fraction 1.0). Weights are the probability of drawing from a folder; with
+  # 40k images each folder is drawn > 10k times, so all of its files appear several times.
+  dirs:
+    - {path: E:/synth/data/backgrounds/inat_hostplants, fraction: 1.0, weight: 0.40}   # host plants, sharpest
+    - {path: E:/synth/data/backgrounds/flowers102,      fraction: 1.0, weight: 0.30}   # close-up plants
+    - {path: E:/synth/data/backgrounds/places365,       fraction: 1.0, weight: 0.30}   # outdoor scenes
+  crop_scale: [0.5, 1.0]
+  min_size: 480
+  hflip: 0.5
+
+compose:
+  num_images: 40000
+  image_size: [1024, 1024]
+  val_fraction: 0.15
+  positive_fraction: 0.5           # 20k with beetles, 20k background-only negatives
+  objects_per_image: [1, 3]        # 1-3 beetles per positive image
+  object_size: null                # size comes from the sprites (render.object_size)
+  # Location: the beetle centre is drawn uniformly over the whole frame (flat centre distribution, see
+  # `popsynth stats`); beetles near the edge are partly cut off, at least min_visible of the box stays inside.
+  placement: uniform_center
+  min_visible: 0.5                 # centre may sit on the frame edge (half the beetle outside)
+  center_sigma: null               # no clustering in the middle
+  box_mode: full
+  color_match: [0.0, 0.25]
+  edge_blur_px: [0.3, 1.0]
+  defocus: {prob: 0.15, sigma_px: [0.4, 1.0]}
+  shadow: {prob: 0.8, strength: [0.2, 0.6], blur: [0.03, 0.12], offset: [0.0, 0.08]}
+  occlusion:                       # beetle (partly) behind a leaf or another foreground object
+    prob: 0.35
+    count: [1, 2]
+    cover: [0.1, 0.6]
+    max_hidden: 0.8
+    size: [0.6, 1.8]
+    blur_sigma_px: [0.8, 3.0]
+    brightness: [0.6, 0.95]
+    contrast: [0.75, 1.0]
+    match_color: [0.4, 0.8]
+    shadow: {strength: [0.15, 0.35], blur: [0.03, 0.08], offset: [0.0, 0.05]}
+    rotate_deg: [0, 360]
+    sources: {leaf: 0.5, background: 0.5}   # leaf = Flavia cutouts, background = patch of the same photo
+    dirs:
+      - E:/synth/data/occluders/flavia
+
+# the two independent pre-compositing augmentations (background crop, beetle sprite) at full strength
+background_aug:
+  prob: 0.8
+  brightness: [0.7, 1.3]
+  contrast: [0.8, 1.2]
+  saturation: [0.65, 1.35]
+  hue_deg: [-15, 15]
+  gamma: [0.75, 1.3]
+  rotate_deg: [-25, 25]
+  vflip: 0.15
+  blur_sigma_px: [0.0, 1.5]
+  grayscale_prob: 0.03
+sprite_aug:
+  prob: 0.8
+  brightness: [0.75, 1.25]
+  contrast: [0.85, 1.15]
+  saturation: [0.75, 1.3]
+  hue_deg: [-10, 10]
+  gamma: [0.8, 1.25]
+  hflip: 0.5
+  aspect: [0.9, 1.1]
+  specular: {prob: 0.3, strength: [0.2, 0.6]}
+  blur_sigma_px: [0.0, 0.8]
+
+lighting:                          # all four conditions, flash at night
+  day:      {weight: 0.50, exposure: [0.8, 1.3],  tint: [[0.95, 1.05], [0.95, 1.05], [0.9, 1.05]],
+             contrast: [0.9, 1.2], saturation: [0.9, 1.2], noise: [0.0, 0.02], vignette: [0.0, 0.2]}
+  overcast: {weight: 0.22, exposure: [0.6, 1.0],  tint: [[0.9, 1.0], [0.95, 1.05], [1.0, 1.1]],
+             contrast: [0.7, 1.0], saturation: [0.6, 0.95], noise: [0.0, 0.03], vignette: [0.0, 0.2]}
+  dusk:     {weight: 0.12, exposure: [0.35, 0.7], tint: [[1.0, 1.15], [0.85, 1.0], [0.7, 0.95]],
+             contrast: [0.8, 1.1], saturation: [0.7, 1.1], noise: [0.01, 0.05], vignette: [0.1, 0.4]}
+  night:    {weight: 0.16, exposure: [0.15, 0.4], tint: [[0.75, 0.95], [0.85, 1.0], [1.0, 1.25]],
+             contrast: [0.7, 1.0], saturation: [0.3, 0.8], noise: [0.03, 0.10], vignette: [0.2, 0.6],
+             flash_prob: 0.4}
+
+camera_effects:                    # clean / mild / clearly bad photos
+  tiers:
+    clean: {weight: 0.40, jpeg_quality: [85, 98]}
+    mild:  {weight: 0.38, blur_prob: 0.4, motion_px: [3, 9], defocus_prob: 0.4, defocus_sigma: [0.6, 1.6],
+            lowres_prob: 0.3, lowres_factor: [1.5, 2.5], haze_prob: 0.2, haze: [0.1, 0.3],
+            exposure_fault_prob: 0.2, overexposure: [1.4, 2.0], underexposure: [0.4, 0.6],
+            noise: [0.0, 0.03], jpeg_quality: [55, 90]}
+    bad:   {weight: 0.22, blur_prob: 0.5, motion_px: [9, 25], defocus_prob: 0.45, defocus_sigma: [1.6, 4.0],
+            lowres_prob: 0.4, lowres_factor: [2.5, 5.0], haze_prob: 0.3, haze: [0.25, 0.5],
+            exposure_fault_prob: 0.4, overexposure: [1.8, 2.8], underexposure: [0.2, 0.4],
+            noise: [0.02, 0.08], jpeg_quality: [20, 55]}
+
+resources:
+  max_ram_gb: 16
+  sprite_cache_gb: 4
+  occluder_cache_gb: 0.5
+
+output:
+  dir: E:/synth/outputs/dataset_40k
+  image_format: png
+  write_masks: true
+  write_yolo: true

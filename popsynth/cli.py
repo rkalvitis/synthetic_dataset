@@ -36,6 +36,9 @@ def main(argv=None) -> int:
     p.add_argument("--background", default=None, help="background photo used on every slide")
     p.add_argument("--only", default=None, help="comma-separated slide names (distance,lighting,viewpoint,...)")
     p = sub.add_parser("export", help="rebuild dataset.json / images.csv / objects.csv / summary.json from metadata.jsonl"); _common(p)
+    p = sub.add_parser("stats", help="plots: beetle size distribution, centre heatmap, per-pixel density, occlusion -> <out>/stats"); _common(p)
+    p.add_argument("--stats-out", default=None, help="output folder (default: <out>/stats)")
+    p.add_argument("--grid", type=int, default=12, help="cells per side of the centre heatmap")
 
     p = sub.add_parser("download-backgrounds", help="fetch Places365 outdoor categories (see scripts/)")
     p.add_argument("--size", default="256", choices=["256", "large"])
@@ -86,6 +89,14 @@ def main(argv=None) -> int:
         import json
         from .labels import export_tables
         print(json.dumps(export_tables(out), indent=2))
+        return 0
+    if a.cmd == "stats":
+        import json
+        from .stats import make_stats
+        r = make_stats(out, a.stats_out, a.grid)
+        print(json.dumps({k: v for k, v in r.items() if k != "center"}, indent=2))
+        print("centre summary:", {k: v for k, v in r.get("center", {}).items() if k != "cell_percent"})
+        print("wrote", *r["files"], sep="\n  ")
         return 0
     if a.cmd == "preview":
         from .preview import make_preview

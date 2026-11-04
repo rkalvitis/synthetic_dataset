@@ -9,11 +9,12 @@ import os
 import cv2
 import numpy as np
 
-from .augment import apply_camera_effects, apply_imperfections, apply_lighting
+from .augment import apply_camera_effects, apply_imperfections, apply_lighting, augment_background, augment_sprite
 from .backgrounds import load_crop
 from .cameras import fixed_camera
 from .compose import crop_to_alpha, paste_sprite
 from .generate import prepare_splat
+from .occlude import OccluderBank, make_occluder, place_occluder
 from .render import get_renderer
 from .render.base import pick_device
 
@@ -108,6 +109,8 @@ class Demo:
             ("effects", self.slide_effects), ("imperfections", self.slide_imperfections),
             ("backgrounds", self.slide_backgrounds),
             ("multiple_beetles", self.slide_multiple), ("negatives", self.slide_negatives),
+            ("occlusion", self.slide_occlusion), ("background_augmentation", self.slide_background_aug),
+            ("sprite_augmentation", self.slide_sprite_aug),
         ]
         paths = []
         for i, (name, fn) in enumerate(slides, 1):
@@ -235,6 +238,63 @@ class Demo:
                  ("background only: overcast", self.light(self.bg, "overcast")),
                  ("background only: night", self.light(self.bg, "night"))]
         return self.slide(idx, "negatives", items)
+
+
+    def slide_occlusion(self, idx):
+        """Beetle behind a leaf: leaf cutouts (if data/occluders exists) and patches of the background in front."""
+        sp = self.sprite()
+        base, mask, _ = self.paste(self.bg, sp, size=0.4)
+        occ = dict(self.cfg["compose"].get("occlusion") or {})
+        bank = OccluderBank(occ.get("dirs"))
+        items = [("no occlusion", self.light(base))]
+        long_px = int(0.4 * self.S)
+        specs = [("background patch, 20% hidden", "background", 0.2, 1.5),
+                 ("background patch, 50% hidden", "background", 0.5, 1.5),
+                 ("background patch, 50% hidden, strongly defocused", "background", 0.5, 3.0)]
+        if len(bank):
+            specs += [("leaf cutout, 25% hidden", "leaf", 0.25, 1.0), ("leaf cutout, 60% hidden, defocused", "leaf", 0.6, 2.5)]
+        else:
+            specs += [("background patch, 70% hidden", "background", 0.7, 2.0),
+                      ("two patches (leaf cutouts need data/occluders)", "background", 0.3, 1.5)]
+        look = dict(brightness=0.8, contrast=0.9, match_color=0.6,
+                    shadow=occ.get("shadow") or {"strength": (0.25, 0.25), "blur": (0.05, 0.05), "offset": (0.03, 0.03)})
+        for n, (label, kind, cover, blur) in enumerate(specs):
+            rng = np.random.default_rng(40 + n)
+            cfg = {**occ, "sources": {kind: 1.0}}
+            img = base
+            for _ in range(2 if label.startswith("two") else 1):
+                o_rgb, o_a, _ = make_occluder(rng, cfg, int(long_px * 1.2), bank, self.bg)
+                img, _, hidden = place_occluder(img, mask, o_rgb, o_a, rng, cover=cover, blur_sigma=blur, **look)
+            items.append((f"{label} (achieved {hidden:.0%})", self.light(img)))
+        return self.slide(idx, "occlusion", items)
+
+    def slide_background_aug(self, idx):
+        """Augmentation 1/2: only the background changes, the beetle is pasted unchanged afterwards."""
+        sp = self.sprite()
+        items = [("background as is", self.light(self.paste(self.bg, sp, size=0.4)[0]))]
+        specs = [("brighter + warmer hue", {"brightness": 1.25, "hue_deg": 12}),
+                 ("darker, less saturated", {"brightness": 0.75, "saturation": 0.7}),
+                 ("hue -12 deg, gamma 1.25", {"hue_deg": -12, "gamma": 1.25}),
+                 ("rotated 18 deg (reflected borders)", {"rotate_deg": 18}),
+                 ("blurred 1.2 px + vertical flip", {"blur_sigma_px": 1.2, "vflip": 1.0})]
+        for label, c in specs:
+            bg, _ = augment_background(self.bg, np.random.default_rng(1), {"prob": 1.0, **c})
+            items.append((label, self.light(self.paste(bg, sp, size=0.4)[0])))
+        return self.slide(idx, "background_augmentation", items)
+
+    def slide_sprite_aug(self, idx):
+        """Augmentation 2/2: only the beetle changes, same background."""
+        sp = self.sprite()
+        items = [("beetle as is", self.light(self.paste(self.bg, sp, size=0.4)[0]))]
+        specs = [("brighter + gamma 0.85", {"brightness": 1.2, "gamma": 0.85}),
+                 ("darker, more saturated", {"brightness": 0.8, "saturation": 1.25}),
+                 ("hue +8 deg, contrast 1.15", {"hue_deg": 8, "contrast": 1.15}),
+                 ("mirrored + aspect 0.92/1.08", {"hflip": 1.0, "aspect": [0.92, 0.92]}),
+                 ("specular glint + blur 0.6 px", {"specular": {"prob": 1.0, "strength": [0.5, 0.5]}, "blur_sigma_px": 0.6})]
+        for n, (label, c) in enumerate(specs):
+            rgb, a, _ = augment_sprite(sp[0], sp[1], np.random.default_rng(2 + n), {"prob": 1.0, **c})
+            items.append((label, self.light(self.paste(self.bg, (rgb, a), size=0.4)[0])))
+        return self.slide(idx, "sprite_augmentation", items)
 
 
 def build_demo(cfg: dict, out_dir: str, image_size: int = 640, sprite_size: int = 1024,
