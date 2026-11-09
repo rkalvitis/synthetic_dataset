@@ -1,4 +1,6 @@
-# Dataset v2: 40k images -> E:\synth_v2   (run from the repo root, PowerShell, env popsynth)
+# Dataset v3: 40k images -> E:\synth_v3   (run from the repo root, PowerShell, env popsynth)
+#   v3 = 33% whole-body visibility floor against frame / beetles / occluders, visible-pixel boxes, bounded exposure,
+#   no RAM cap (resources.max_ram_gb: null), all sprites and leaf cutouts cached in RAM.
 #   conda activate popsynth
 #   .\scripts\run_40k.ps1            # or copy the lines one by one
 
@@ -17,3 +19,7 @@ python -m popsynth.cli preview -c configs/e_synth_40k.yaml -n 24
 
 # if stage 2 dies partway, re-run only compose (re-uses the rendered sprites):
 #   python -m popsynth.cli compose -c configs/e_synth_40k.yaml
+
+# 5. repair the v2 run of 2026-11-04 in place (hidden beetles, blank frames); files go to E:\synth_v2\_removed
+#   python -m popsynth.cli clean -o E:/synth_v2 --dry-run
+#   python -m popsynth.cli clean -o E:/synth_v2 --boxes visible     # also switch the labels to visible-pixel boxes (2026-11-06)

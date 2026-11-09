@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-from .augment import apply_camera_effects, apply_lighting, augment_background, augment_sprite
+from .augment import apply_photometric, augment_background, augment_sprite
 from .backgrounds import BackgroundPool
 from .cameras import projected_extent, resized, sample_camera
 from .compose import crop_to_alpha, paste_sprite
@@ -143,6 +143,44 @@ def render_sprites(cfg: dict, out_dir: str, num: int | None = None, verbose: boo
     return sprites_dir
 
 
+CAMERA_EFFECT_KEYS = ("motion_blur_px", "defocus_sigma", "lowres_factor", "haze", "overexposure", "underexposure",
+                      "sensor_noise", "jpeg_quality", "gaussian_blur_sigma")
+
+
+def _u(rng, r):
+    return float(rng.uniform(r[0], r[1])) if isinstance(r, (list, tuple)) else float(r)
+
+
+def _visible_share(alpha: np.ndarray, covered: np.ndarray, body_px: int | None = None) -> float:
+    """Share of a pasted beetle not covered by `covered` (> 0.5). Measured against `body_px` (the whole beetle,
+    part outside the frame included) when given, else against its pixels inside the frame (alpha > 0.5)."""
+    body = alpha > 0.5
+    tot = int(body_px) if body_px else int(body.sum())
+    return 1.0 if tot == 0 else float((body & ~(covered > 0.5)).sum()) / tot
+
+
+def _floor_ok(new_alpha: np.ndarray, new_body_px: int, new_floor: float,
+              alphas: list, body_px: list, covered: list, floors: list) -> bool:
+    """The visibility rule at paste time: the new beetle keeps >= new_floor of its whole body inside the frame,
+    and every earlier beetle keeps >= its floor after the new one is on top (`covered` already includes it)."""
+    if _visible_share(new_alpha, np.zeros_like(new_alpha), new_body_px) < new_floor:
+        return False
+    return all(_visible_share(a, c, b) >= v for a, b, c, v in zip(alphas, body_px, covered, floors))
+
+
+def _occluder_caps(alphas: list, body_px: list, laters: list, floors: list, max_hidden: float, respect: bool) -> list:
+    """Per beetle: the largest share of its still-visible pixels an occluder may hide. With `respect` the beetle
+    must keep >= floor of its WHOLE body: visible_after >= floor * body  <=>  hidden/remaining <= 1 - floor*body/rem."""
+    caps = []
+    for a, b, lt, v in zip(alphas, body_px, laters, floors):
+        cap = float(max_hidden)
+        if respect:
+            rem = max(float(((a > 0.5) & ~lt).sum()), 1.0)
+            cap = min(cap, max(0.0, 1.0 - v * float(b) / rem))
+        caps.append(cap)
+    return caps
+
+
 def _touches_border(alpha: np.ndarray, thresh: float = 0.03) -> bool:
     return bool(alpha[0].max() > thresh or alpha[-1].max() > thresh or alpha[:, 0].max() > thresh or alpha[:, -1].max() > thresh)
 
@@ -222,7 +260,10 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
               f"[{pool.describe()}] -> {out_dir}")
         if leaf_bank is not None:
             print(f"occlusion: prob {occ_cfg.get('prob')}, {len(leaf_bank)} leaf cutouts, sources {occ_cfg.get('sources')}")
-    counts = {"train": 0, "val": 0, "popillia": 0, "background": 0, "occluded": 0}
+    counts = {"train": 0, "val": 0, "popillia": 0, "background": 0, "occluded": 0, "skipped_overlap": 0, "redrawn": 0}
+    # one visibility floor (share of the WHOLE beetle, part outside the frame included) against everything:
+    # the frame edge, beetles pasted later and leaf / background occluders
+    visible_floor = cc.get("visible_floor", cc.get("overlap_min_visible", 0.33))
     t0 = time.time()
     for i in tqdm(range(num), desc="compose", disable=not verbose):
         rng = np.random.default_rng([int(cfg["seed"]), 11, i])
@@ -235,6 +276,7 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
         bg, bam = augment_background(bg, rng, cfg.get("background_aug"))
         meta.update(bam)
         img, mask, boxes, objs, obj_alphas = bg, None, [], [], []
+        covered_by_later, obj_min_vis, obj_body_px = [], [], []   # per pasted beetle: union of later beetles; floor; whole-body px
         if positive:
             lo, hi = cc.get("objects_per_image", [1, 1])
             for _ in range(int(rng.integers(int(lo), int(hi) + 1))):
@@ -246,18 +288,36 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
                 # when the output short side differs from the one the sprites were rendered for (preview profile)
                 from_sprite = rec.get("size_mode") == "object" or cc.get("object_size") in (None, "from_sprite")
                 scale = min(W, H) / rec.get("for_short_side", min(W, H)) if from_sprite else None
-                img, m, pm = paste_sprite(
-                    img, s_rgb, s_a, rng, scale=scale,
-                    object_size=tuple(cc.get("object_size") or (0.1, 0.9)), min_visible=cc.get("min_visible", 0.6),
-                    color_match=tuple(cc.get("color_match", (0, 0))), shadow=cc.get("shadow"),
-                    edge_blur_px=tuple(cc.get("edge_blur_px", (0, 0))), defocus=cc.get("defocus"),
-                    center_sigma=cc.get("center_sigma"), placement=cc.get("placement", "uniform"))
-                if pm.get("bbox"):
+                # the beetle must keep >= its floor of its whole body inside the frame, and must leave every
+                # earlier beetle >= its own floor uncovered; otherwise another position is tried and, failing
+                # that, this beetle is skipped
+                pm = {}
+                v_new = _u(rng, visible_floor)
+                for _try in range(int(cc.get("overlap_tries", 12))):
+                    cand, m, pm = paste_sprite(
+                        img, s_rgb, s_a, rng, scale=scale,
+                        object_size=tuple(cc.get("object_size") or (0.1, 0.9)), min_visible=cc.get("min_visible", 0.6),
+                        color_match=tuple(cc.get("color_match", (0, 0))), shadow=cc.get("shadow"),
+                        edge_blur_px=tuple(cc.get("edge_blur_px", (0, 0))), defocus=cc.get("defocus"),
+                        center_sigma=cc.get("center_sigma"), placement=cc.get("placement", "uniform"))
+                    if not pm.get("bbox"):
+                        break
+                    covered = [np.maximum(c, m) for c in covered_by_later]
+                    if _floor_ok(m, pm["body_px"], v_new, obj_alphas, obj_body_px, covered, obj_min_vis):
+                        img = cand
+                        covered_by_later = covered + [np.zeros((H, W), np.float32)]
+                        obj_min_vis.append(v_new); obj_body_px.append(int(pm["body_px"]))
+                        break
+                    pm = {}
+                if not pm.get("bbox"):
+                    counts["skipped_overlap"] += 1
+                else:
                     objs.append({"object_id": len(objs), "sprite": rec["file"], "sprite_index": rec["index"],
                                  "elevation_deg": rec["elevation_deg"], "azimuth_deg": rec["azimuth_deg"],
                                  "roll_deg": rec["roll_deg"], "fov_deg": rec["fov_deg"],
                                  "camera_distance": rec.get("distance"), **pm, **sam,
-                                 "mask_area_px": int((m > 0.5).sum())})
+                                 "mask_area_px": int((m > 0.5).sum()), "body_area_px": int(pm["body_px"]),
+                                 "visible_floor": round(v_new, 3)})
                     obj_alphas.append(m)
             # leaves / foreground patches in front of the beetles. The occluder targets (and max_hidden)
             # refer to the pixels still visible after beetles pasted later have covered earlier ones.
@@ -267,8 +327,12 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
                 for ma in obj_alphas[k + 1:]:
                     lt |= ma > 0.5
                 laters.append(lt)
+            # an occluder may hide at most occlusion.max_hidden of what is still visible and (respect_floor,
+            # default on) must leave the beetle >= its floor of its whole body
+            caps = _occluder_caps(obj_alphas, obj_body_px, laters, obj_min_vis,
+                                  float(occ_cfg.get("max_hidden", 0.85)), bool(occ_cfg.get("respect_floor", True)))
             img, visible, occ_meta = occlude_objects(img, [a * ~lt for a, lt in zip(obj_alphas, laters)],
-                                                     rng, occ_cfg, leaf_bank, bg_photo)
+                                                     rng, occ_cfg, leaf_bank, bg_photo, max_hidden=caps)
             meta["occluders"] = occ_meta
             meta["num_occluders"] = len(occ_meta)
             if occ_meta:
@@ -287,8 +351,10 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
                 o["occluded_by_occluder_frac"] = round(float((full & ~later & ~vis).sum() / tot), 3)
                 o["occluded_frac"] = round(float((full & ~vis).sum() / tot), 3)
                 o["visible_area_px"] = int(vis.sum())
+                o["visible_share"] = round(int(vis.sum()) / max(int(o.get("body_area_px") or tot), 1), 3)   # of the whole beetle
                 ys, xs = np.where(vis)
                 o["bbox_visible_xyxy"] = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1] if len(ys) else None
+                o["bbox_full_xyxy"] = list(o["bbox"])
                 if box_mode == "visible":
                     if o["bbox_visible_xyxy"] is None:
                         continue
@@ -298,10 +364,12 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
             objs, boxes = keep_objs, keep_boxes
             for k, o in enumerate(objs):
                 o["object_id"] = k
-        img, lm = apply_lighting(img, rng, cfg.get("lighting"))
-        img, cm = apply_camera_effects(img, rng, cfg.get("camera_effects", {}))
-        meta.update(lm); meta.update(cm)
-        meta["effects"] = sorted(k for k in cm if k != "quality_tier")
+        cam_cfg = cfg.get("camera_effects", {})
+        img, pmeta = apply_photometric(img, rng, cfg.get("lighting"), cam_cfg, cam_cfg.get("guard"))
+        meta.update(pmeta)
+        meta["effects"] = sorted(k for k in pmeta if k in CAMERA_EFFECT_KEYS)
+        if pmeta.get("redrawn"):
+            counts["redrawn"] += 1
         meta["objects"] = objs
         writer.write(f"img_{i:06d}", split, img, mask, boxes, meta)
         counts[split] += 1

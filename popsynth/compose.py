@@ -49,7 +49,8 @@ def paste_sprite(
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     """Composite one sprite. bg/sprite_rgb float32 RGB in [0,1]; sprite_alpha float32 [0,1].
 
-    Returns (image, mask (H,W) float alpha of the pasted object, meta with bbox etc.).
+    Returns (image, mask (H,W) float alpha of the pasted object, meta with bbox etc.; `body_px` = pixels of the
+    whole beetle before the frame clip, `body_in_frame_frac` = share of them inside the frame).
     object_size: longest side of the object as a fraction of the shorter background side.
     center: optional (x, y) in image fractions where the object centre is placed (overrides min_visible).
     placement: "uniform" = the box is placed uniformly over all positions where it fits (min_visible);
@@ -102,6 +103,7 @@ def paste_sprite(
         px = int(rng.integers(min(x_min, x_max), max(x_min, x_max) + 1))
         py = int(rng.integers(min(y_min, y_max), max(y_min, y_max) + 1))
 
+    body_px = int((a > 0.5).sum())                      # whole beetle, before the frame clip
     # clip sprite to the frame
     sx0, sy0 = max(0, -px), max(0, -py)
     sx1, sy1 = min(nw, W - px), min(nh, H - py)
@@ -153,6 +155,7 @@ def paste_sprite(
     meta = {
         "bbox": bbox, "object_size_frac": round(size_frac, 3), "object_px": [nw, nh],
         "visible_frac": round(float((sx1 - sx0) * (sy1 - sy0)) / (nw * nh), 3),
+        "body_px": body_px, "body_in_frame_frac": round(float((a > 0.5).sum()) / max(body_px, 1), 3),
         "color_match": round(cm, 3), "defocus_sigma": round(df_sigma, 2), **sh_meta,
     }
     return out, mask, meta

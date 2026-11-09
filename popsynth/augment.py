@@ -5,17 +5,21 @@ import cv2
 import numpy as np
 
 # Each lighting mode: exposure multiplier, RGB tint (white balance), contrast, saturation, noise sigma.
+# `mean_range` bounds the mean luminance of the finished frame for that mode (a real photo in that light).
 DEFAULT_MODES = {
     "day":      {"weight": 0.55, "exposure": [0.8, 1.3],  "tint": [[0.95, 1.05], [0.95, 1.05], [0.9, 1.05]],
-                 "contrast": [0.9, 1.2],  "saturation": [0.9, 1.2],  "noise": [0.0, 0.02], "vignette": [0.0, 0.2]},
-    "overcast": {"weight": 0.20, "exposure": [0.6, 1.0],  "tint": [[0.9, 1.0],  [0.95, 1.05], [1.0, 1.1]],
-                 "contrast": [0.7, 1.0],  "saturation": [0.6, 0.95], "noise": [0.0, 0.03], "vignette": [0.0, 0.2]},
-    "dusk":     {"weight": 0.10, "exposure": [0.35, 0.7], "tint": [[1.0, 1.15], [0.85, 1.0],  [0.7, 0.95]],
-                 "contrast": [0.8, 1.1],  "saturation": [0.7, 1.1],  "noise": [0.01, 0.05], "vignette": [0.1, 0.4]},
-    "night":    {"weight": 0.15, "exposure": [0.1, 0.35], "tint": [[0.75, 0.95], [0.85, 1.0],  [1.0, 1.25]],
-                 "contrast": [0.7, 1.0],  "saturation": [0.3, 0.8],  "noise": [0.03, 0.10], "vignette": [0.2, 0.6],
-                 "flash_prob": 0.4},
+                 "contrast": [0.9, 1.2],  "saturation": [0.9, 1.2],  "noise": [0.0, 0.02], "vignette": [0.0, 0.2],
+                 "mean_range": [0.30, 0.75]},
+    "overcast": {"weight": 0.20, "exposure": [0.65, 1.0], "tint": [[0.9, 1.0],  [0.95, 1.05], [1.0, 1.1]],
+                 "contrast": [0.7, 1.0],  "saturation": [0.6, 0.95], "noise": [0.0, 0.03], "vignette": [0.0, 0.2],
+                 "mean_range": [0.22, 0.60]},
+    "dusk":     {"weight": 0.10, "exposure": [0.45, 0.75], "tint": [[1.0, 1.15], [0.85, 1.0], [0.7, 0.95]],
+                 "contrast": [0.8, 1.1],  "saturation": [0.7, 1.1],  "noise": [0.01, 0.04], "vignette": [0.1, 0.35]},
+    "night":    {"weight": 0.15, "exposure": [0.3, 0.55], "tint": [[0.75, 0.95], [0.85, 1.0],  [1.0, 1.25]],
+                 "contrast": [0.7, 1.0],  "saturation": [0.4, 0.8],  "noise": [0.02, 0.06], "vignette": [0.15, 0.45],
+                 "flash_prob": 0.4, "mean_range": [0.14, 0.34]},
 }
+DEFAULT_MODES["dusk"]["mean_range"] = [0.18, 0.45]
 
 
 def _u(rng, r):
@@ -57,12 +61,26 @@ def apply_lighting(img: np.ndarray, rng: np.random.Generator, modes: dict | None
         r2 = ((xx - W / 2) / (W / 2)) ** 2 + ((yy - H / 2) / (H / 2)) ** 2
         out = out * (1 - vig * np.clip(r2 / 2, 0, 1))[..., None]
 
+    # bound the RESULT: whatever the background, its jitter and the multipliers above did, the mean luminance of
+    # the frame ends inside the mode's `mean_range` (what a photo in that light actually looks like)
+    clamp = 1.0
+    mr = m.get("mean_range")
+    if mr:
+        lum = float((np.clip(out, 0, 1) @ np.array([0.299, 0.587, 0.114], np.float32)).mean())
+        if lum < mr[0]:
+            clamp = mr[0] / max(lum, 1e-4)
+        elif lum > mr[1]:
+            clamp = mr[1] / max(lum, 1e-4)
+        if clamp != 1.0:
+            out = out * clamp
     noise = _u(rng, m.get("noise", 0.0))
     if noise > 0:
         out = out + rng.normal(0, noise, out.shape).astype(np.float32)
     out = np.clip(out, 0, 1)
-    meta = {"lighting": mode, "exposure": round(exposure, 3), "contrast": round(contrast, 3),
+    meta = {"lighting": mode, "exposure": round(exposure * clamp, 3), "contrast": round(contrast, 3),
             "saturation": round(saturation, 3), "noise": round(noise, 3), "flash": flash}
+    if clamp != 1.0:
+        meta["exposure_clamp"] = round(clamp, 3)
     return out, meta
 
 
@@ -112,15 +130,20 @@ def apply_imperfections(img: np.ndarray, rng: np.random.Generator, tiers: dict,
         sg = _u(rng, t.get("defocus_sigma", (0.5, 1.5))); out = _gauss(out, sg); meta["defocus_sigma"] = round(sg, 2)
     if rng.random() < t.get("lowres_prob", 0):
         f = _u(rng, t.get("lowres_factor", (1.5, 3.0))); out = _lowres(out, f); meta["lowres_factor"] = round(f, 2)
+    hazed = False
     if rng.random() < t.get("haze_prob", 0):
         h = _u(rng, t.get("haze", (0.1, 0.4)))
-        out = out * (1 - h) + h * np.array([0.78, 0.78, 0.8], np.float32); meta["haze"] = round(h, 2)
-    if rng.random() < t.get("exposure_fault_prob", 0):
+        out = out * (1 - h) + h * np.array([0.78, 0.78, 0.8], np.float32); meta["haze"] = round(h, 2); hazed = True
+    # exposure faults never stack on haze (haze lifts the blacks, a gain on top of it whites the frame out)
+    if not hazed and rng.random() < t.get("exposure_fault_prob", 0):
         if rng.random() < 0.5:
-            g = _u(rng, t.get("overexposure", (1.6, 2.6))); meta["overexposure"] = round(g, 2)
+            g = _u(rng, t.get("overexposure", (1.6, 2.6)))
+            out, g = overexpose(out, g, max_mean=float(t.get("max_mean", 0.78)))
+            meta["overexposure"] = round(g, 2)
         else:
-            g = _u(rng, t.get("underexposure", (0.25, 0.5))); meta["underexposure"] = round(g, 2)
-        out = out * g
+            g = _u(rng, t.get("underexposure", (0.25, 0.5)))
+            out, g = underexpose(out, g, min_mean=float(t.get("min_mean", 0.13)))
+            meta["underexposure"] = round(g, 2)
     out = np.clip(out, 0, 1)
     n = _u(rng, t.get("noise", (0.0, 0.0)))
     if n > 0:
@@ -129,6 +152,85 @@ def apply_imperfections(img: np.ndarray, rng: np.random.Generator, tiers: dict,
     if jq:
         q = int(rng.integers(int(jq[0]), int(jq[1]) + 1)); out = _jpeg(out, q); meta["jpeg_quality"] = q
     return np.ascontiguousarray(out), meta
+
+
+def _lum_mean(img: np.ndarray) -> float:
+    return float((img @ np.array([0.299, 0.587, 0.114], np.float32)).mean())
+
+
+def overexpose(img: np.ndarray, gain: float, max_mean: float = 0.82, knee: float = 0.8) -> tuple[np.ndarray, float]:
+    """Blown-out photo that still shows the subject: the gain is capped so the mean luminance stays below
+    `max_mean`, and highlights above `knee` roll off with an exponential shoulder instead of clipping flat.
+    Returns (image in [0,1], the gain actually used)."""
+    m = _lum_mean(img)
+    if m > 1e-4:
+        gain = float(min(gain, max(1.0, max_mean / m)))
+    y = img * gain
+    hi = y > knee
+    y = np.where(hi, knee + (1 - knee) * (1 - np.exp(-(y - knee) / (1 - knee))), y)
+    return np.clip(y, 0, 1).astype(np.float32), gain
+
+
+def underexpose(img: np.ndarray, gain: float, min_mean: float = 0.05) -> tuple[np.ndarray, float]:
+    """Dark photo with the subject still visible: the gain is raised so the mean luminance stays above `min_mean`."""
+    m = _lum_mean(img)
+    if m > 1e-4:
+        gain = float(max(gain, min(1.0, min_mean / m)))
+    return np.clip(img * gain, 0, 1).astype(np.float32), gain
+
+
+def is_legible(img: np.ndarray, mean_range=(0.05, 0.9), min_std: float = 0.03) -> bool:
+    """False for a frame that is blank: (almost) all white, all black or without contrast."""
+    lum = img @ np.array([0.299, 0.587, 0.114], np.float32)
+    m = float(lum.mean())
+    return mean_range[0] <= m <= mean_range[1] and float(lum.std()) >= min_std
+
+
+def apply_photometric(img: np.ndarray, rng: np.random.Generator, lighting: dict | None, camera: dict,
+                      guard: dict | None = None) -> tuple[np.ndarray, dict]:
+    """Lighting + camera effects with a legibility guard: if the result is a blank frame (see `is_legible`),
+    both are re-drawn (up to guard.tries times); the last resort is lighting without camera degradation.
+    guard keys: mean [lo, hi], min_std, tries (default {mean: [0.12, 0.80], min_std: 0.05, tries: 4})."""
+    g = {"mean": (0.12, 0.80), "min_std": 0.05, "tries": 4}
+    g.update(guard or {})
+    tries = max(1, int(g["tries"]))
+    for k in range(tries):
+        out, lm = apply_lighting(img, rng, lighting)
+        out, cm = apply_camera_effects(out, rng, camera)
+        if is_legible(out, tuple(g["mean"]), float(g["min_std"])):
+            if k:
+                cm["redrawn"] = k
+            return out, {**lm, **cm}
+    out, lm = apply_lighting(img, rng, lighting)
+    out = rescue_exposure(out, tuple(g["mean"]), float(g["min_std"]))
+    tiers = camera.get("tiers") or {}
+    clean = {n: t for n, t in tiers.items() if not any(key in t for key in ("exposure_fault_prob", "haze_prob"))}
+    cm = {}
+    if clean:
+        out, cm = apply_imperfections(out, rng, clean)
+    cm["redrawn"] = tries
+    return out, {**lm, **cm}
+
+
+def rescue_exposure(img: np.ndarray, mean_range=(0.05, 0.9), min_std: float = 0.03) -> np.ndarray:
+    """Last resort for a frame the lighting alone made blank: pull the mean luminance back into range and
+    stretch the contrast until the frame has at least `min_std` of spread."""
+    lo, hi = mean_range
+    out = img
+    m = _lum_mean(out)
+    if m < lo and m > 1e-6:
+        out = np.clip(out * (2.5 * lo / m), 0, 1)
+    elif m > hi:
+        out, _ = overexpose(out, 1.0, max_mean=0.5 * (lo + hi))
+        m2 = _lum_mean(out)
+        if m2 > hi:
+            out = np.clip(out * (0.5 * (lo + hi) / m2), 0, 1)
+    lum = out @ np.array([0.299, 0.587, 0.114], np.float32)
+    sd = float(lum.std())
+    if sd < min_std and sd > 1e-6:
+        mu = float(lum.mean())
+        out = np.clip(mu + (out - mu) * (1.5 * min_std / sd), 0, 1)
+    return out.astype(np.float32)
 
 
 def apply_camera_effects(img: np.ndarray, rng: np.random.Generator, cfg: dict) -> tuple[np.ndarray, dict]:

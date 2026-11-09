@@ -40,6 +40,17 @@ def main(argv=None) -> int:
     p.add_argument("--stats-out", default=None, help="output folder (default: <out>/stats)")
     p.add_argument("--grid", type=int, default=12, help="cells per side of the centre heatmap")
 
+    p = sub.add_parser("clean", help="repair a generated dataset in place: drop boxes of invisible beetles, quarantine images "
+                                     "with too-hidden beetles or blank frames (-> <out>/_removed), rebuild the tables"); _common(p)
+    p.add_argument("--min-visible", type=float, default=0.2, help="a beetle visible less than this -> image quarantined "
+                                                                    "(0.2 = the v2 leaf cap, so only beetle-on-beetle cases are hit)")
+    p.add_argument("--drop-below", type=float, default=0.05, help="a beetle visible less than this -> its box is dropped, image kept")
+    p.add_argument("--no-blank", action="store_true", help="skip the pixel scan for blank frames")
+    p.add_argument("--workers", type=int, default=None)
+    p.add_argument("--boxes", default="keep", choices=["keep", "visible", "full"],
+                   help="rewrite the label boxes: visible = tight around the pixels still visible under leaves / patches / "
+                        "other beetles (bbox_visible_xyxy), full = whole body; keep = leave as generated")
+    p.add_argument("--dry-run", action="store_true", help="report only, change nothing")
     p = sub.add_parser("download-backgrounds", help="fetch Places365 outdoor categories (see scripts/)")
     p.add_argument("--size", default="256", choices=["256", "large"])
     p.add_argument("--out", default="data/backgrounds/places365")
@@ -97,6 +108,10 @@ def main(argv=None) -> int:
         print(json.dumps({k: v for k, v in r.items() if k != "center"}, indent=2))
         print("centre summary:", {k: v for k, v in r.get("center", {}).items() if k != "cell_percent"})
         print("wrote", *r["files"], sep="\n  ")
+        return 0
+    if a.cmd == "clean":
+        from .clean import clean_dataset
+        clean_dataset(out, a.min_visible, a.drop_below, not a.no_blank, workers=a.workers, dry_run=a.dry_run, box_mode=a.boxes)
         return 0
     if a.cmd == "preview":
         from .preview import make_preview

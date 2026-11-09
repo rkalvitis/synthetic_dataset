@@ -42,7 +42,7 @@ OBJECT_COLUMNS = [
     "bbox_area_frac", "mask_area_px", "visible_frac", "occluded_frac", "object_size_frac", "object_px",
     "sprite", "sprite_index", "elevation_deg", "azimuth_deg", "roll_deg", "fov_deg", "camera_distance",
     "color_match", "defocus_sigma", "shadow_strength", "shadow_blur_px",
-    "occluded_by_beetle_frac", "occluded_by_occluder_frac", "visible_area_px", "bbox_visible_xyxy",
+    "occluded_by_beetle_frac", "occluded_by_occluder_frac", "visible_area_px", "body_area_px", "visible_share", "visible_floor", "body_in_frame_frac", "bbox_visible_xyxy", "bbox_full_xyxy",
     "sprite_aug", "aug_brightness", "aug_contrast", "aug_saturation", "aug_hue_deg", "aug_gamma", "aug_hflip",
     "aug_aspect", "aug_specular", "aug_blur_sigma_px",
 ]

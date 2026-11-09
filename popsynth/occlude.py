@@ -271,14 +271,14 @@ def make_occluder(rng: np.random.Generator, cfg: dict, long_px: int, bank: Occlu
 
 
 def occlude_objects(img: np.ndarray, obj_masks: list[np.ndarray], rng: np.random.Generator, cfg: dict,
-                    bank: OccluderBank | None = None, bg_photo: np.ndarray | None = None
-                    ) -> tuple[np.ndarray, list[np.ndarray], list[dict]]:
+                    bank: OccluderBank | None = None, bg_photo: np.ndarray | None = None,
+                    max_hidden: list[float] | None = None) -> tuple[np.ndarray, list[np.ndarray], list[dict]]:
     """Apply the configured occlusion to a composite with beetles `obj_masks` (float (H,W) each).
 
     cfg keys: prob (per positive image), count [lo,hi] occluders, cover [lo,hi] target hidden fraction of
     the chosen beetle, size [lo,hi] occluder long side relative to the beetle's long side, blur_sigma_px,
     brightness, sources {leaf, background}, rotate_deg, max_hidden (skip an occluder that would hide
-    more than this of any beetle).
+    more than this of any beetle); the `max_hidden` argument overrides it per beetle (one value per mask).
     Returns (image, visible masks (beetle alpha x (1 - occluder alpha)), list of occluder meta dicts)."""
     if not cfg or not obj_masks or rng.random() >= float(cfg.get("prob", 0.0)):
         return img, obj_masks, []
@@ -288,7 +288,7 @@ def occlude_objects(img: np.ndarray, obj_masks: list[np.ndarray], rng: np.random
     occ_total = np.zeros(img.shape[:2], np.float32)
     out = img
     metas = []
-    max_hidden = float(cfg.get("max_hidden", 0.85))
+    caps = list(max_hidden) if max_hidden is not None else [float(cfg.get("max_hidden", 0.85))] * len(obj_masks)
     for _ in range(n):
         j = int(rng.integers(len(obj_masks)))
         ys, xs = np.where(visible[j] > 0.5)
@@ -311,9 +311,13 @@ def occlude_objects(img: np.ndarray, obj_masks: list[np.ndarray], rng: np.random
                                               match_color=match, shadow=cfg.get("shadow"))
         # reject if any beetle would end up almost completely hidden
         too_much = False
-        for m in obj_masks:
-            tot = max(float(m.sum()), 1e-6)
-            if float((m * np.clip(occ_total + o_full, 0, 1)).sum()) / tot > max_hidden:
+        # measured exactly like the dataset's visible_area_px (visible = alpha x (1 - occluder) > 0.5), so a
+        # soft occluder edge over a small beetle cannot slip under the cap
+        occ_new = np.clip(occ_total + o_full, 0, 1)
+        for m, cap in zip(obj_masks, caps):
+            body = m > 0.5
+            tot = max(int(body.sum()), 1)
+            if 1.0 - int(((m * (1 - occ_new)) > 0.5).sum()) / tot > cap:
                 too_much = True
         if too_much:
             continue

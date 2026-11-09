@@ -61,7 +61,8 @@ data/backgrounds/**      --(2) compose + augment-->  <out>/images/{train,val}/{p
      focus plane), slightly darkened and flattened, colour-matched to the spot they cover, and cast a soft
      contact shadow, so they do not look like pasted stickers. The hidden fraction, source
      and the visible box are recorded per beetle; `compose.box_mode` chooses whether the label box covers
-     the whole body (default) or only the visible pixels.
+     only the visible pixels (default since 2026-11-06: a beetle under a leaf or a background patch is boxed
+     by what is left of it) or the whole body (`full`, amodal). Both boxes are always stored.
    - **Placement** (`compose.placement`): `uniform` places the box uniformly over every position where the
      whole beetle fits (big beetles then necessarily sit near the middle); `uniform_center` draws the centre
      uniformly over the whole frame and shifts the beetle inside only as far as needed, which gives a flat
@@ -162,6 +163,13 @@ python scripts/download_leaf_occluders.py       # Flavia leaf scans (~1 GB) -> d
 # full dataset on the GPU machine (40k images, 5000 sprites, every variation, all backgrounds, 16 GB RAM cap)
 popsynth generate -c configs/e_synth_40k.yaml
 popsynth stats    -c configs/e_synth_40k.yaml
+popsynth clean    -o E:/synth_v2                # repair an older run: drop invisible beetles, quarantine blank frames (see below)
+python scripts/compare_visibility.py "v1=E:/synth/outputs/dataset_20k" "v2=E:/synth_v2"   # visibility graphs, several datasets side by side
+python scripts/compare_coverage.py   "v1=E:/synth/outputs/dataset_20k" "v2=E:/synth_v2"   # per-pixel coverage (position bias) side by side
+python scripts/compare_size.py       "v1=E:/synth/outputs/dataset_20k" "v2=E:/synth_v2"   # beetle size in the images, side by side
+python scripts/compare_sprites.py    "v1=E:/synth/outputs/dataset_20k" "v2=E:/synth_v2"   # the rendered sprites themselves: size, rendered vs pasted, re-use, viewpoints, alpha
+#   all four scripts take --separate <folder> to write every panel as its own PNG (one plot per file, to pick from),
+#   compare_coverage.py also --by-size <png> for the size-normalised maps
 
 # re-composite with different backgrounds / augmentation without re-rendering
 popsynth compose -o outputs/popillia_10k --set compose.image_size=[224,224] --set lighting.night.weight=0.3
@@ -185,12 +193,14 @@ Key knobs:
 | `compose.object_size` | beetle size as fraction of the shorter image side; only used with `render.size_mode: fixed` |
 | `compose.positive_fraction` | share of images containing a beetle |
 | `compose.objects_per_image` | `[1, 3]` to paste several beetles (detection) |
-| `lighting.*` | per-mode exposure, white balance, contrast, saturation, noise, vignette, flash |
+| `lighting.*` | per-mode exposure, white balance, contrast, saturation, noise, vignette, flash; `mean_range` bounds the mean luminance of the finished frame for that light (night 0.14-0.34 ... day 0.30-0.75), so background jitter and camera faults cannot stack into a black or white frame |
 | `camera_effects.tiers` | quality tiers (clean / mild / bad) with per-effect probabilities: motion blur, defocus, low resolution, haze, over/under-exposure, noise, JPEG |
 | `background_aug`, `sprite_aug` | the two independent pre-compositing augmentations (`prob` + a range per parameter; a parameter is skipped if its range is absent) |
+| `compose.visible_floor`, `compose.overlap_tries` | the 33% rule: every beetle keeps at least this share of its *whole* body visible (default `0.33`; a range `[lo, hi]` draws it per beetle) against the frame edge (the part outside counts as hidden), beetles pasted later and, with `occlusion.respect_floor: true` (default), leaf / background occluders; a placement that would break it is re-drawn `overlap_tries` times, then that beetle is skipped. `overlap_min_visible` is the old name and still read |
+| `camera_effects.guard` | `{mean: [lo, hi], min_std, tries}`: lighting + effects are re-drawn when the frame comes out blank (white / black / no contrast); over/under-exposure cap the gain so the mean stays within the tier's `min_mean` / `max_mean` and highlights roll off softly; an exposure fault never stacks on haze |
 | `compose.occlusion` | beetle behind a leaf: `prob`, `count`, `cover` (target hidden fraction), `max_hidden`, `size`, `blur_sigma_px`, `brightness`, `contrast`, `match_color` (blend toward the covered spot), `shadow`, `sources {leaf, background}`, `dirs` (cutout folders) |
 | `compose.placement`, `compose.center_sigma` | `uniform` (box uniform where it fits) or `uniform_center` (flat centre distribution); `center_sigma` = std of a normal distribution around the image centre instead |
-| `compose.box_mode` | `full` (box covers the whole beetle, hidden parts included) or `visible` (tight around the visible pixels) |
+| `compose.box_mode` | `visible` (default: tight around the pixels still visible under leaves / patches / other beetles) or `full` (whole beetle, hidden parts included). `popsynth clean --boxes visible|full` switches an existing dataset |
 | `resources.max_ram_gb`, `sprite_cache_gb`, `occluder_cache_gb` | RAM cap of the process (hard on Windows, watchdog elsewhere) and the sizes of the decoded sprite / leaf-cutout caches |
 
 ## Output format
@@ -233,9 +243,10 @@ Per beetle (`objects.csv`, `metadata.jsonl[objects]`, `dataset.json[annotations]
 | Field | Meaning |
 |---|---|
 | `image_name`, `object_id` | which image, index within it |
-| `bbox_xyxy`, `bbox_cxcywh_norm`, `bbox_w_px`, `bbox_h_px`, `bbox_area_frac` | tight box around visible beetle pixels (mask > 0.5), in pixels and normalised |
+| `bbox_xyxy`, `bbox_cxcywh_norm`, `bbox_w_px`, `bbox_h_px`, `bbox_area_frac` | the label box (`box_mode`: visible pixels by default), in pixels and normalised |
 | `mask_area_px`, `visible_frac`, `occluded_frac` | beetle pixel count, fraction of the sprite inside the frame (1.0 = whole beetle visible), fraction of its pixels hidden (by a beetle pasted later or by an occluder; with `box_mode: full` the box still covers the full body) |
-| `occluded_by_beetle_frac`, `occluded_by_occluder_frac`, `visible_area_px`, `bbox_visible_xyxy` | split of the hidden fraction, visible pixel count and the tight box around the visible pixels |
+| `occluded_by_beetle_frac`, `occluded_by_occluder_frac`, `visible_area_px`, `bbox_visible_xyxy`, `bbox_full_xyxy` | split of the hidden fraction, visible pixel count, the tight box around the visible pixels and the full-body box (both always present, whichever is the label) |
+| `body_area_px`, `body_in_frame_frac`, `visible_share`, `visible_floor` | pixels of the whole beetle (part outside the frame included), share of them inside the frame, visible pixels / whole body (the quantity the 33% rule bounds) and the floor drawn for this beetle |
 | `sprite_aug`, `aug_brightness`, `aug_contrast`, `aug_saturation`, `aug_hue_deg`, `aug_gamma`, `aug_hflip`, `aug_aspect`, `aug_specular`, `aug_blur_sigma_px` | beetle augmentation: list of applied parameters and their values |
 | `object_size_frac`, `object_px` | beetle longest side as fraction of the short image side, and in px |
 | `elevation_deg`, `azimuth_deg`, `roll_deg`, `fov_deg`, `camera_distance` | 3D view: elevation above the beetle's horizon, heading, in-plane rotation, lens field of view, camera distance (model units) |
@@ -286,6 +297,30 @@ as PNG in `outputs/demo/NN_*/`.
 ```bash
 pytest            # or: python scripts/run_tests_no_pytest.py
 ```
+
+## Repairing a generated dataset (`popsynth clean`)
+
+Runs before 2026-11-05 could label a beetle that was completely hidden behind another beetle, and the
+`bad` camera tier could burn a frame out to pure white (haze + over-exposure) or black. Both are fixed
+in the generator (`overlap_min_visible`, `camera_effects.guard`); an existing dataset is repaired in place:
+
+```bash
+popsynth clean -o E:/synth_v2 --dry-run      # report only
+popsynth clean -o E:/synth_v2                # apply; options: --min-visible 0.2 --drop-below 0.05 --workers 8 --no-blank
+popsynth clean -o E:/synth_v2 --boxes visible   # also rewrite the label boxes to the visible pixels (from bbox_visible_xyxy)
+```
+
+- a beetle visible less than `--drop-below` (5%) of its body has no usable pixels: its box / label line is
+  removed, the image stays;
+- `--boxes visible` (or `full`) rewrites every label box, label file and table from the boxes stored per beetle,
+  without reading pixels; the previous box is kept as `bbox_full_xyxy`, so the switch is reversible;
+- a beetle visible less than `--min-visible` (20%, the v2 leaf cap) still shows but is too hidden: the image is quarantined;
+- a blank frame (mean luminance outside 0.05-0.9 or std < 0.03, measured on the pixels) is quarantined.
+
+Quarantined images / labels / masks are *moved* to `<out>/_removed/` (same paths, reasons in
+`_removed/removed.jsonl`), `metadata.jsonl` is backed up to `metadata.jsonl.bak`, and `dataset.json`,
+`images.csv`, `objects.csv`, `summary.json` are rebuilt. The command is idempotent. Expect roughly 1 000
+hidden-beetle images and 850 blank frames (~4.5%) to be removed from the 40k run of 2026-11-04.
 
 ## Notes / known limitations
 
