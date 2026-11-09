@@ -1,0 +1,21 @@
+# Video sequences for PatchNet / tracker training (2026-11) on the Windows GPU machine -> E:\synth_seq
+# 10 000 sequences of 40-100 frames (640 px JPEG), each on its own background photo; the first frames are empty and
+# the beetle walks in from any side; its pose is re-rendered from the splat every frame; 0-2 distractor beetles,
+# leaf / background occluders on its path, moving camera, drifting light, motion blur.
+# Usage:  python -m popsynth.cli sequences -c configs/e_synth_seq.yaml        (resumable: re-run after a crash)
+#         python -m popsynth.cli sequence-gifs -c configs/e_synth_seq.yaml -n 0 --sheet   # sheets of every sequence
+# The GIFs with the boxes are written while generating (<out>/_gifs/<split>/seq_xxxxxx.gif, ~1-2 MB each).
+# Pixel motion below is for 640 px frames at a nominal 30 fps; re-tune sequences.motion / sequences.camera (or
+# filter by the per-frame speeds in frames.jsonl) once the real camera is known.
+_base: e_synth_40k.yaml
+
+sequences:
+  num_sequences: 10000
+  length: [40, 100]
+  frame_size: [640, 640]
+  jpeg_quality: 90
+  min_render_px: 1024        # same view quality as the v3 sprites (fast on gsplat)
+  gif: {every: 1, max_side: 240, frame_step: 2}
+
+output:
+  dir: E:/synth_seq            # created if missing

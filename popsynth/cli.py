@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .config import load_config
@@ -24,9 +25,24 @@ def main(argv=None) -> int:
     p = sub.add_parser("compose", help="stage 2: composite existing sprites onto backgrounds"); _common(p)
     p.add_argument("--num-images", "-n", type=int, default=None)
     p.add_argument("--sprites", default=None, help="sprites dir (default: <out>/sprites)")
+    p.add_argument("--workers", "-j", default=None, help="worker processes for stage 2 (int or auto; default resources.workers)")
+    p.add_argument("--resume", action="store_true", help="continue a stopped / crashed run: keep the images already written")
     p = sub.add_parser("generate", help="stage 1 + stage 2"); _common(p)
     p.add_argument("--num-sprites", type=int, default=None)
     p.add_argument("--num-images", "-n", type=int, default=None)
+    p.add_argument("--workers", "-j", default=None, help="worker processes for stage 2 (int or auto; default resources.workers)")
+    p = sub.add_parser("sequences", help="video sequences for tracker training: the beetle re-rendered every frame "
+                                         "while it walks across the same background (GOT-10k layout, see popsynth/sequences.py)"); _common(p)
+    p.add_argument("--num-sequences", "-n", type=int, default=None)
+    p.add_argument("--overwrite", action="store_true", help="redo sequences that already exist (default: resume)")
+    p.add_argument("--disc", action="store_true", help="stand-in disc instead of the splat (dry run of the motion, no GPU)")
+    p.add_argument("--workers", "-j", default=None, help="worker processes, each with its own renderer (int or auto; default resources.workers)")
+    p = sub.add_parser("sequence-gifs", help="animated GIFs (+ sheets) of generated sequences with the boxes drawn -> <out>/_gifs"); _common(p)
+    p.add_argument("-n", type=int, default=12, help="first n sequences (0 = all)")
+    p.add_argument("--gif-out", default=None)
+    p.add_argument("--max-side", type=int, default=240)
+    p.add_argument("--frame-step", type=int, default=2)
+    p.add_argument("--sheet", action="store_true", help="also a contact sheet per sequence")
     p = sub.add_parser("preview", help="write a contact sheet of a generated dataset"); _common(p)
     p.add_argument("-n", type=int, default=16)
     p.add_argument("--preview-out", default=None)
@@ -84,11 +100,11 @@ def main(argv=None) -> int:
     if a.cmd == "compose":
         import os
         from .generate import compose_dataset
-        compose_dataset(cfg, a.sprites or os.path.join(out, "sprites"), out, a.num_images)
+        compose_dataset(cfg, a.sprites or os.path.join(out, "sprites"), out, a.num_images, workers=a.workers, resume=a.resume)
         return 0
     if a.cmd == "generate":
         from .generate import generate
-        generate(cfg, out, a.num_sprites, a.num_images)
+        generate(cfg, out, a.num_sprites, a.num_images, workers=a.workers)
         return 0
     if a.cmd == "demo":
         from .demo import build_demo
@@ -112,6 +128,15 @@ def main(argv=None) -> int:
     if a.cmd == "clean":
         from .clean import clean_dataset
         clean_dataset(out, a.min_visible, a.drop_below, not a.no_blank, workers=a.workers, dry_run=a.dry_run, box_mode=a.boxes)
+        return 0
+    if a.cmd == "sequences":
+        from .sequences import generate_sequences
+        generate_sequences(cfg, out, a.num_sequences, overwrite=a.overwrite, workers=a.workers, disc=a.disc)
+        return 0
+    if a.cmd == "sequence-gifs":
+        from .seqpreview import make_sequence_gifs
+        paths = make_sequence_gifs(out, a.gif_out, a.n or None, a.max_side, a.frame_step, a.sheet)
+        print(f"wrote {len(paths)} files to {a.gif_out or os.path.join(out, '_gifs')}")
         return 0
     if a.cmd == "preview":
         from .preview import make_preview

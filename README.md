@@ -203,6 +203,20 @@ Key knobs:
 | `compose.box_mode` | `visible` (default: tight around the pixels still visible under leaves / patches / other beetles) or `full` (whole beetle, hidden parts included). `popsynth clean --boxes visible|full` switches an existing dataset |
 | `resources.max_ram_gb`, `sprite_cache_gb`, `occluder_cache_gb` | RAM cap of the process (hard on Windows, watchdog elsewhere) and the sizes of the decoded sprite / leaf-cutout caches |
 
+### Speed: worker processes, stopping and resuming
+
+Stage 1 (sprites) runs on the GPU; stage 2 (compose) and the sequence generator are CPU work and run in one process
+by default. `resources.workers` (or `--workers N` / `-j N`, `auto` = half of the cores) spreads the images or
+sequences over that many processes; every image / sequence is seeded by its index, so the result is identical to a
+single-process run (verified byte for byte). Each worker holds at most 2 GB of sprite cache and 0.5 GB of occluders,
+plus a 1-2 GB working set at 1024 px: budget ~3-4 GB of RAM per worker. The Windows configs use 10 of 20 cores.
+
+Any run can be stopped (Ctrl+C) and continued: `popsynth compose -c <cfg> --resume` keeps the images already on
+disk, repairs a cut-off metadata line and merges leftover `metadata.part*.jsonl` files, then does only the missing
+indices; `popsynth sequences` resumes by itself (finished `seq_*/meta.json` folders are kept; `--overwrite` redoes
+them). A run that was killed before the end has no `dataset.json` / csv tables yet: `popsynth export -o <dir>`
+rebuilds them from `metadata.jsonl` (or `--resume` finishes the run and writes them).
+
 ## Output format
 
 ```
@@ -291,6 +305,45 @@ as PNG in `outputs/demo/NN_*/`.
 
 `summary.json` also carries `occluded_frac`, `center_in_middle_third`, `center_in_middle_half`, `center_x/y`,
 `images_with_occluder`, `occluder_source`, `background_aug` and `sprite_aug` counts.
+
+## Video sequences for tracker training (`popsynth sequences`)
+
+A short-range template matcher (PatchNet, SiamFC-style training) needs consecutive frames of the *same* beetle, which
+the single-image generator does not give. `popsynth sequences` simulates one scene over time and re-renders the
+beetle from the splat **every frame** at its current pose and size (popsynth/sequences.py):
+
+- the first frames are empty; the beetle walks in from any side within a few frames (`sequences.start`), follows a
+  smooth path (typical speed + random acceleration, turns, pauses; its in-plane rotation follows the heading), its
+  viewpoint drifts (azimuth / elevation / roll), it grows or shrinks slowly, and it may leave and come back;
+- 0-2 distractor beetles with their own paths, often crossing the target's;
+- static leaf / background-patch occluders on the target's path (partial, sometimes complete occlusion);
+- a camera that pans, shakes, zooms and rolls a little over an oversized background canvas (or stays still),
+  motion blur from the apparent object and camera motion, lighting interpolated between keyframes, one camera
+  quality tier per sequence (defocus, low-res, haze, exposure fault, noise, JPEG);
+- every sequence on its own background photo; the val photos are never used for train sequences.
+
+The motion is simulated first and the frames are rendered afterwards, so every box comes from the simulation
+state. Output in GOT-10k layout, object 0 = the tracked target:
+```
+<out>/train/seq_000000/00000001.jpg ...   frames (640 px JPEG by default)
+                       groundtruth.txt    x,y,w,h of the target per frame (pixels; visible pixels only)
+                       absence.label      1 = target (almost) invisible: outside the frame or hidden
+                       cover.label        0..8 = visible share of the whole body x 8
+                       cut_by_image.label 1 = cut by the frame edge
+                       tracks.json        every object: boxes xyxy (visible + full/amodal), absence, visible share
+                       frames.jsonl       per frame: camera pan/zoom/shift, lighting, every beetle's pose, speed, boxes
+                       meta.json          seed, photo, drawn parameters, target motion summary
+<out>/{train,val}/list.txt   <out>/sequences.jsonl   <out>/summary.json   <out>/_gifs/<split>/seq_xxxxxx.gif
+```
+```
+python -m popsynth.cli sequences -c configs/e_synth_seq.yaml            # 10 000 sequences -> E:/synth_seq (resumable)
+python -m popsynth.cli sequences -c configs/default.yaml -o outputs/seq_check --disc -n 10   # motion dry run, no GPU
+python -m popsynth.cli sequence-gifs -o outputs/seq_check -n 12 --sheet  # GIFs + contact sheets with the boxes
+```
+Every key of the `sequences:` section of configs/default.yaml is documented there; `motion` and `camera` are in
+pixels per frame at `frame_size` and the nominal `fps` and should be re-tuned once the real camera is known
+(`summary.json` reports the resulting per-frame displacement of the target). `popsynth/dataset.py` is for the
+single-image set; a pair sampler (frame t, frame t + gap) for PatchNet belongs to the training repo.
 
 ## Tests
 

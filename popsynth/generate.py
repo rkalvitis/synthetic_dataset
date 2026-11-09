@@ -6,8 +6,10 @@ Every image is seeded from (seed, index), so a dataset can be regenerated or ext
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
+import shutil
 import time
 
 import cv2
@@ -238,79 +240,87 @@ class SpriteBank:
         return lst[int(rng.integers(len(lst)))]
 
 
-def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None = None,
-                    verbose: bool = True) -> str:
-    cc, oc = cfg["compose"], cfg["output"]
-    res = cfg.get("resources") or {}
-    max_ram = res.get("max_ram_gb")
-    if verbose:
-        print(limit_memory(max_ram))
-    num = num or cc["num_images"]
-    W, H = int(cc["image_size"][0]), int(cc["image_size"][1])
-    bank = SpriteBank(sprites_dir, cache_gb=float(res.get("sprite_cache_gb", 2.0)))
-    pool = BackgroundPool(cfg["backgrounds"]["dirs"], min_size=int(cfg["backgrounds"].get("min_size", 64)),
-                          seed=int(cfg.get("seed", 0)))
-    writer = DatasetWriter(out_dir, oc.get("image_format", "jpg"), oc.get("jpeg_quality", 95),
-                           oc.get("write_masks", True), oc.get("write_yolo", True))
-    occ_cfg = cc.get("occlusion") or {}
-    leaf_bank = OccluderBank(occ_cfg.get("dirs"), cache_gb=float(res.get("occluder_cache_gb", 0.5))) if occ_cfg.get("prob", 0) > 0 else None
-    box_mode = cc.get("box_mode", "full")
-    if verbose:
-        print(f"compose: {num} images of {W}x{H}, {len(bank.records)} sprites, {len(pool)} backgrounds "
-              f"[{pool.describe()}] -> {out_dir}")
-        if leaf_bank is not None:
-            print(f"occlusion: prob {occ_cfg.get('prob')}, {len(leaf_bank)} leaf cutouts, sources {occ_cfg.get('sources')}")
-    counts = {"train": 0, "val": 0, "popillia": 0, "background": 0, "occluded": 0, "skipped_overlap": 0, "redrawn": 0}
-    # one visibility floor (share of the WHOLE beetle, part outside the frame included) against everything:
-    # the frame edge, beetles pasted later and leaf / background occluders
-    visible_floor = cc.get("visible_floor", cc.get("overlap_min_visible", 0.33))
-    t0 = time.time()
-    for i in tqdm(range(num), desc="compose", disable=not verbose):
-        rng = np.random.default_rng([int(cfg["seed"]), 11, i])
-        split = "val" if rng.random() < cc.get("val_fraction", 0.15) else "train"
-        positive = rng.random() < cc.get("positive_fraction", 0.5)
-        bg, meta = pool.sample(rng, W, H, tuple(cc.get("crop_scale", cfg["backgrounds"].get("crop_scale", (0.4, 1.0)))),
-                               cfg["backgrounds"].get("hflip", 0.5))
+class _Composer:
+    """Everything one process needs to compose images: sprites, backgrounds, occluders and a writer.
+    `image(i)` composes image i (seeded by (seed, 11, i), independent of every other image)."""
+
+    def __init__(self, cfg: dict, sprites_dir: str, out_dir: str, meta_name: str = "metadata.jsonl", cache_div: int = 1):
+        cc, oc = cfg["compose"], cfg["output"]
+        res = cfg.get("resources") or {}
+        self.cfg, self.cc = cfg, cc
+        self.max_ram = res.get("max_ram_gb")
+        self.W, self.H = int(cc["image_size"][0]), int(cc["image_size"][1])
+        # with several workers each one gets its share of the cache, at most 2 GB sprites / 0.5 GB occluders: a cache
+        # miss is one PNG decode (~20 ms) against ~1 s of compositing, so small per-worker caches cost almost nothing
+        sprite_gb = float(res.get("sprite_cache_gb", 2.0))
+        occ_gb = float(res.get("occluder_cache_gb", 0.5))
+        if cache_div > 1:
+            sprite_gb, occ_gb = min(sprite_gb / cache_div, 2.0), min(occ_gb / cache_div, 0.5)
+        self.bank = SpriteBank(sprites_dir, cache_gb=sprite_gb)
+        self.pool = BackgroundPool(cfg["backgrounds"]["dirs"], min_size=int(cfg["backgrounds"].get("min_size", 64)),
+                                   seed=int(cfg.get("seed", 0)))
+        self.writer = DatasetWriter(out_dir, oc.get("image_format", "jpg"), oc.get("jpeg_quality", 95),
+                                    oc.get("write_masks", True), oc.get("write_yolo", True), meta_name=meta_name)
+        self.occ_cfg = cc.get("occlusion") or {}
+        self.leaf_bank = OccluderBank(self.occ_cfg.get("dirs"), cache_gb=occ_gb) if self.occ_cfg.get("prob", 0) > 0 else None
+        self.box_mode = cc.get("box_mode", "full")
+        # one visibility floor (share of the WHOLE beetle, part outside the frame included) against everything:
+        # the frame edge, beetles pasted later and leaf / background occluders
+        self.visible_floor = cc.get("visible_floor", cc.get("overlap_min_visible", 0.33))
+        self.counts = {"train": 0, "val": 0, "popillia": 0, "background": 0, "occluded": 0, "skipped_overlap": 0, "redrawn": 0}
+
+    def describe(self) -> str:
+        s = f"{len(self.bank.records)} sprites, {len(self.pool)} backgrounds [{self.pool.describe()}]"
+        if self.leaf_bank is not None:
+            s += f"; occlusion: prob {self.occ_cfg.get('prob')}, {len(self.leaf_bank)} leaf cutouts, sources {self.occ_cfg.get('sources')}"
+        return s
+
+    def image(self, i: int) -> None:
+        rng = np.random.default_rng([int(self.cfg["seed"]), 11, i])
+        split = "val" if rng.random() < self.cc.get("val_fraction", 0.15) else "train"
+        positive = rng.random() < self.cc.get("positive_fraction", 0.5)
+        bg, meta = self.pool.sample(rng, self.W, self.H, tuple(self.cc.get("crop_scale", self.cfg["backgrounds"].get("crop_scale", (0.4, 1.0)))),
+                               self.cfg["backgrounds"].get("hflip", 0.5))
         bg_photo = bg                                   # un-augmented crop: source for "background" occluders
         # augmentation 1/2: background only
-        bg, bam = augment_background(bg, rng, cfg.get("background_aug"))
+        bg, bam = augment_background(bg, rng, self.cfg.get("background_aug"))
         meta.update(bam)
         img, mask, boxes, objs, obj_alphas = bg, None, [], [], []
         covered_by_later, obj_min_vis, obj_body_px = [], [], []   # per pasted beetle: union of later beetles; floor; whole-body px
         if positive:
-            lo, hi = cc.get("objects_per_image", [1, 1])
+            lo, hi = self.cc.get("objects_per_image", [1, 1])
             for _ in range(int(rng.integers(int(lo), int(hi) + 1))):
-                rec = bank.sample(rng, split)
-                s_rgb, s_a = bank.load(rec)
+                rec = self.bank.sample(rng, split)
+                s_rgb, s_a = self.bank.load(rec)
                 # augmentation 2/2: beetle only
-                s_rgb, s_a, sam = augment_sprite(s_rgb, s_a, rng, cfg.get("sprite_aug"))
+                s_rgb, s_a, sam = augment_sprite(s_rgb, s_a, rng, self.cfg.get("sprite_aug"))
                 # size decided at render time (render.size_mode: object): paste the sprite 1:1, rescaled only
                 # when the output short side differs from the one the sprites were rendered for (preview profile)
-                from_sprite = rec.get("size_mode") == "object" or cc.get("object_size") in (None, "from_sprite")
-                scale = min(W, H) / rec.get("for_short_side", min(W, H)) if from_sprite else None
+                from_sprite = rec.get("size_mode") == "object" or self.cc.get("object_size") in (None, "from_sprite")
+                scale = min(self.W, self.H) / rec.get("for_short_side", min(self.W, self.H)) if from_sprite else None
                 # the beetle must keep >= its floor of its whole body inside the frame, and must leave every
                 # earlier beetle >= its own floor uncovered; otherwise another position is tried and, failing
                 # that, this beetle is skipped
                 pm = {}
-                v_new = _u(rng, visible_floor)
-                for _try in range(int(cc.get("overlap_tries", 12))):
+                v_new = _u(rng, self.visible_floor)
+                for _try in range(int(self.cc.get("overlap_tries", 12))):
                     cand, m, pm = paste_sprite(
                         img, s_rgb, s_a, rng, scale=scale,
-                        object_size=tuple(cc.get("object_size") or (0.1, 0.9)), min_visible=cc.get("min_visible", 0.6),
-                        color_match=tuple(cc.get("color_match", (0, 0))), shadow=cc.get("shadow"),
-                        edge_blur_px=tuple(cc.get("edge_blur_px", (0, 0))), defocus=cc.get("defocus"),
-                        center_sigma=cc.get("center_sigma"), placement=cc.get("placement", "uniform"))
+                        object_size=tuple(self.cc.get("object_size") or (0.1, 0.9)), min_visible=self.cc.get("min_visible", 0.6),
+                        color_match=tuple(self.cc.get("color_match", (0, 0))), shadow=self.cc.get("shadow"),
+                        edge_blur_px=tuple(self.cc.get("edge_blur_px", (0, 0))), defocus=self.cc.get("defocus"),
+                        center_sigma=self.cc.get("center_sigma"), placement=self.cc.get("placement", "uniform"))
                     if not pm.get("bbox"):
                         break
                     covered = [np.maximum(c, m) for c in covered_by_later]
                     if _floor_ok(m, pm["body_px"], v_new, obj_alphas, obj_body_px, covered, obj_min_vis):
                         img = cand
-                        covered_by_later = covered + [np.zeros((H, W), np.float32)]
+                        covered_by_later = covered + [np.zeros((self.H, self.W), np.float32)]
                         obj_min_vis.append(v_new); obj_body_px.append(int(pm["body_px"]))
                         break
                     pm = {}
                 if not pm.get("bbox"):
-                    counts["skipped_overlap"] += 1
+                    self.counts["skipped_overlap"] += 1
                 else:
                     objs.append({"object_id": len(objs), "sprite": rec["file"], "sprite_index": rec["index"],
                                  "elevation_deg": rec["elevation_deg"], "azimuth_deg": rec["azimuth_deg"],
@@ -323,24 +333,24 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
             # refer to the pixels still visible after beetles pasted later have covered earlier ones.
             laters = []
             for k in range(len(obj_alphas)):
-                lt = np.zeros((H, W), bool)
+                lt = np.zeros((self.H, self.W), bool)
                 for ma in obj_alphas[k + 1:]:
                     lt |= ma > 0.5
                 laters.append(lt)
             # an occluder may hide at most occlusion.max_hidden of what is still visible and (respect_floor,
             # default on) must leave the beetle >= its floor of its whole body
             caps = _occluder_caps(obj_alphas, obj_body_px, laters, obj_min_vis,
-                                  float(occ_cfg.get("max_hidden", 0.85)), bool(occ_cfg.get("respect_floor", True)))
+                                  float(self.occ_cfg.get("max_hidden", 0.85)), bool(self.occ_cfg.get("respect_floor", True)))
             img, visible, occ_meta = occlude_objects(img, [a * ~lt for a, lt in zip(obj_alphas, laters)],
-                                                     rng, occ_cfg, leaf_bank, bg_photo, max_hidden=caps)
+                                                     rng, self.occ_cfg, self.leaf_bank, bg_photo, max_hidden=caps)
             meta["occluders"] = occ_meta
             meta["num_occluders"] = len(occ_meta)
             if occ_meta:
-                counts["occluded"] += 1
+                self.counts["occluded"] += 1
             # how much of each beetle is hidden: by beetles pasted later (`occluded_by_beetle_frac`), by
             # occluders (`occluded_by_occluder_frac`), and in total (`occluded_frac`). The full-body box
             # is kept as `bbox`; `bbox_visible_xyxy` is the tight box around the visible pixels.
-            mask = np.zeros((H, W), np.float32)
+            mask = np.zeros((self.H, self.W), np.float32)
             keep_objs, keep_boxes = [], []
             for k, o in enumerate(objs):
                 full = obj_alphas[k] > 0.5
@@ -355,7 +365,7 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
                 ys, xs = np.where(vis)
                 o["bbox_visible_xyxy"] = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1] if len(ys) else None
                 o["bbox_full_xyxy"] = list(o["bbox"])
-                if box_mode == "visible":
+                if self.box_mode == "visible":
                     if o["bbox_visible_xyxy"] is None:
                         continue
                     o["bbox"] = o["bbox_visible_xyxy"]
@@ -364,28 +374,163 @@ def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None =
             objs, boxes = keep_objs, keep_boxes
             for k, o in enumerate(objs):
                 o["object_id"] = k
-        cam_cfg = cfg.get("camera_effects", {})
-        img, pmeta = apply_photometric(img, rng, cfg.get("lighting"), cam_cfg, cam_cfg.get("guard"))
+        cam_cfg = self.cfg.get("camera_effects", {})
+        img, pmeta = apply_photometric(img, rng, self.cfg.get("lighting"), cam_cfg, cam_cfg.get("guard"))
         meta.update(pmeta)
         meta["effects"] = sorted(k for k in pmeta if k in CAMERA_EFFECT_KEYS)
         if pmeta.get("redrawn"):
-            counts["redrawn"] += 1
+            self.counts["redrawn"] += 1
         meta["objects"] = objs
-        writer.write(f"img_{i:06d}", split, img, mask, boxes, meta)
-        counts[split] += 1
-        counts["popillia" if boxes else "background"] += 1
-        if i % 50 == 0:
-            check_limit(max_ram, f"compose image {i}")
-    writer.close()
+        self.writer.write(f"img_{i:06d}", split, img, mask, boxes, meta)
+        self.counts[split] += 1
+        self.counts["popillia" if boxes else "background"] += 1
+
+    def close(self, export: bool) -> None:
+        self.writer.close(export=export)
+
+
+def _compose_worker(cfg: dict, sprites_dir: str, out_dir: str, indices: list, k: int, n_workers: int, q) -> None:
+    """One worker process: its own caches, its own metadata part file; reports progress through `q`."""
+    limit_memory((cfg.get("resources") or {}).get("max_ram_gb"))
+    comp = _Composer(cfg, sprites_dir, out_dir, meta_name=f"metadata.part{k}.jsonl", cache_div=n_workers)
+    try:
+        for n, i in enumerate(indices):
+            comp.image(i)
+            if n % 5 == 4:
+                q.put(("progress", k, 5))
+                check_limit(comp.max_ram, f"compose worker {k} image {i}")
+        q.put(("progress", k, len(indices) % 5))
+        comp.close(export=False)
+        q.put(("done", k, comp.counts, comp.bank.cache_info()))
+    except BaseException as e:   # noqa: BLE001  (the parent must not hang)
+        comp.close(export=False)
+        q.put(("error", k, repr(e), None))
+        raise
+
+
+def _resume_plan(out_dir: str, num: int, verbose: bool) -> list[int]:
+    """Images still to do after a crash / stop: those without a metadata record whose image file exists.
+    metadata.jsonl is rewritten with the valid records only (a truncated last line, records of missing files
+    and leftover part files of an interrupted parallel run are folded in or dropped)."""
+    meta_path = os.path.join(out_dir, "metadata.jsonl")
+    lines = []
+    for fn in [meta_path] + sorted(glob.glob(os.path.join(out_dir, "metadata.part*.jsonl"))):
+        if os.path.exists(fn):
+            with open(fn) as f:
+                lines += f.read().splitlines()
+    kept, done = {}, set()
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        try:
+            idx = int(r["name"].split("_")[-1])
+        except (KeyError, ValueError):
+            continue
+        if idx < num and os.path.exists(os.path.join(out_dir, r["image"])):
+            kept[idx] = line
+            done.add(idx)
+    if lines:
+        shutil.copy2(meta_path, meta_path + ".resume.bak") if os.path.exists(meta_path) else None
+        with open(meta_path, "w") as f:
+            for idx in sorted(kept):
+                f.write(kept[idx] + "\n")
+        for fn in glob.glob(os.path.join(out_dir, "metadata.part*.jsonl")):
+            os.remove(fn)
+    todo = [i for i in range(num) if i not in done]
+    if verbose:
+        print(f"resume: {len(done)} of {num} images already there, {len(todo)} to do")
+    return todo
+
+
+def compose_dataset(cfg: dict, sprites_dir: str, out_dir: str, num: int | None = None,
+                    verbose: bool = True, workers: int | None = None, resume: bool = False) -> str:
+    """Stage 2. `workers` > 1 composes the images in that many processes (each image is seeded by its index, so
+    the result is identical to a single-process run); `resume` skips images that already exist (after a stop)."""
+    cc, oc = cfg["compose"], cfg["output"]
+    res = cfg.get("resources") or {}
+    max_ram = res.get("max_ram_gb")
+    if verbose:
+        print(limit_memory(max_ram))
+    num = num or cc["num_images"]
+    W, H = int(cc["image_size"][0]), int(cc["image_size"][1])
+    workers = resolve_workers(workers if workers is not None else res.get("workers", 1))
+    indices = _resume_plan(out_dir, num, verbose) if resume else list(range(num))
+    os.makedirs(out_dir, exist_ok=True)
+    t0 = time.time()
+    counts = {"train": 0, "val": 0, "popillia": 0, "background": 0, "occluded": 0, "skipped_overlap": 0, "redrawn": 0}
+    if workers <= 1 or len(indices) < 2 * workers:
+        comp = _Composer(cfg, sprites_dir, out_dir)
+        if verbose:
+            print(f"compose: {len(indices)} images of {W}x{H}, {comp.describe()} -> {out_dir}")
+        for n, i in enumerate(tqdm(indices, desc="compose", disable=not verbose)):
+            comp.image(i)
+            if n % 50 == 0:
+                check_limit(max_ram, f"compose image {i}")
+        counts = comp.counts
+        cache_info = comp.bank.cache_info()
+        comp.close(export=True)
+    else:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        q = ctx.Queue()
+        shards = [indices[k::workers] for k in range(workers)]
+        procs = [ctx.Process(target=_compose_worker, args=(cfg, sprites_dir, out_dir, sh, k, workers, q), daemon=True)
+                 for k, sh in enumerate(shards)]
+        if verbose:
+            print(f"compose: {len(indices)} images of {W}x{H} in {workers} worker processes "
+                  f"(per worker <= {min(float(res.get('sprite_cache_gb', 2.0)) / workers, 2.0):.1f} GB sprite cache + "
+                  f"{min(float(res.get('occluder_cache_gb', 0.5)) / workers, 0.5):.1f} GB occluders + ~1-2 GB working set) -> {out_dir}")
+        for pr in procs:
+            pr.start()
+        alive, infos, errors = workers, [], []
+        with tqdm(total=len(indices), desc="compose", disable=not verbose) as bar:
+            while alive:
+                msg = q.get()
+                if msg[0] == "progress":
+                    bar.update(msg[2])
+                elif msg[0] == "done":
+                    alive -= 1
+                    for k_, v in msg[2].items():
+                        counts[k_] += v
+                    infos.append(msg[3])
+                else:
+                    alive -= 1
+                    errors.append(msg[2])
+        for pr in procs:
+            pr.join()
+        # merge the part files into metadata.jsonl (resume reads parts too, so a crash here loses nothing)
+        with open(os.path.join(out_dir, "metadata.jsonl"), "a") as out:
+            for k in range(workers):
+                part = os.path.join(out_dir, f"metadata.part{k}.jsonl")
+                if os.path.exists(part):
+                    with open(part) as f:
+                        shutil.copyfileobj(f, out)
+                    os.remove(part)
+        if errors:
+            raise RuntimeError(f"{len(errors)} compose worker(s) failed: {errors[0]}  (re-run with --resume)")
+        from .labels import export_tables
+        export_tables(out_dir)
+        cache_info = "; ".join(infos)
     if verbose:
         print(f"done in {time.time() - t0:.1f}s: {counts}")
-        print(f"{bank.cache_info()}; peak RAM {fmt(peak_rss_bytes())}")
+        print(f"{cache_info}; peak RAM {fmt(peak_rss_bytes())}")
         print(f"labels: {out_dir}/dataset.json (COCO + metadata), images.csv, objects.csv, summary.json")
     return out_dir
 
 
+def resolve_workers(w) -> int:
+    """resources.workers: an int, or 'auto' = half of the cores (at most 16)."""
+    if w in (None, 1, "1", ""):
+        return 1
+    if isinstance(w, str) and w.lower() == "auto":
+        return max(1, min((os.cpu_count() or 2) // 2, 16))
+    return max(1, int(w))
+
+
 def generate(cfg: dict, out_dir: str | None = None, num_sprites: int | None = None,
-             num_images: int | None = None, verbose: bool = True) -> str:
+             num_images: int | None = None, verbose: bool = True, workers: int | None = None) -> str:
     out_dir = out_dir or cfg["output"]["dir"]
     sprites_dir = render_sprites(cfg, out_dir, num_sprites, verbose)
-    return compose_dataset(cfg, sprites_dir, out_dir, num_images, verbose)
+    return compose_dataset(cfg, sprites_dir, out_dir, num_images, verbose, workers=workers)

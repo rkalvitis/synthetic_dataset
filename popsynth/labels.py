@@ -60,7 +60,7 @@ def xyxy_to_cxcywh_norm(box, W: int, H: int) -> list[float]:
 
 class DatasetWriter:
     def __init__(self, root: str, image_format: str = "jpg", jpeg_quality: int = 95,
-                 write_masks: bool = True, write_yolo: bool = True):
+                 write_masks: bool = True, write_yolo: bool = True, meta_name: str = "metadata.jsonl"):
         self.root = root
         self.fmt = image_format
         self.q = jpeg_quality
@@ -69,7 +69,7 @@ class DatasetWriter:
         os.makedirs(root, exist_ok=True)
         with open(os.path.join(root, "classes.txt"), "w") as f:
             f.write("\n".join(CLASS_NAMES) + "\n")
-        self._meta = open(os.path.join(root, "metadata.jsonl"), "a")
+        self._meta = open(os.path.join(root, meta_name), "a")
 
     def write(self, name: str, split: str, img: np.ndarray, mask: np.ndarray | None,
               boxes: list[list[int]], meta: dict) -> str:
@@ -122,15 +122,27 @@ class DatasetWriter:
         self._meta.write(json.dumps(rec) + "\n")
         return path
 
-    def close(self):
+    def close(self, export: bool = True):
         self._meta.close()
-        export_tables(self.root)
+        if export:
+            export_tables(self.root)
 
 
 # ----------------------------------------------------------------------------- dataset-wide exports
 def read_metadata(root: str) -> list[dict]:
+    """All records of metadata.jsonl; a truncated line (process killed while writing) is skipped with a note."""
+    recs, bad = [], 0
     with open(os.path.join(root, "metadata.jsonl")) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                recs.append(json.loads(line))
+            except json.JSONDecodeError:
+                bad += 1
+    if bad:
+        print(f"metadata.jsonl: skipped {bad} unreadable line(s) (interrupted write); `popsynth compose --resume` regenerates them")
+    return recs
 
 
 def _cell(v):

@@ -171,6 +171,68 @@ camera_effects:
             exposure_fault_prob: 0.3, overexposure: [1.4, 2.0], underexposure: [0.4, 0.6],
             noise: [0.02, 0.08], jpeg_quality: [20, 55]}
 
+# Video sequences for tracker training (`popsynth sequences`, popsynth/sequences.py): one scene simulated over
+# time, the beetle re-rendered from the splat EVERY frame at its current pose and size. GOT-10k layout:
+# <out>/<split>/seq_xxxxxx/{00000001.jpg.., groundtruth.txt, absence.label, cover.label, cut_by_image.label,
+# tracks.json, frames.jsonl, meta.json}. Pixel values below refer to `frame_size` at the nominal `fps`; re-tune
+# `motion` and `camera` once the real camera's frame rate and typical pixel motion are known.
+sequences:
+  num_sequences: 20            # full run: 10000 (one photo per sequence, see own_background)
+  length: [40, 100]            # frames per sequence, uniform
+  val_fraction: 0.15           # split at sequence level; the val photos are never used for train sequences
+  frame_size: [640, 640]
+  fps: 30                      # nominal only (recorded in meta.json)
+  jpeg_quality: 90
+  own_background: true         # every sequence gets a different photo (seeded order; wraps when the pool is smaller)
+  object_size: [0.06, 0.40]    # beetle long side / short frame side at the start (then it drifts, see scale_*)
+  absent_below: 0.05           # visible share of the whole body below which the frame is marked absent
+  min_render_px: 512           # every view is rendered with at least this many pixels and area-downsampled
+  lighting_keyframe_frames: [20, 50]   # lighting parameters interpolate between keyframes this many frames apart
+  start:                       # the first frames are empty: every beetle starts completely outside the view ...
+    empty: true
+    entry_gap_px: [2, 20]      # ... this far beyond the edge (target) ...
+    distractor_gap_px: [0, 80] # ... (distractors) ...
+    entry_frames: [2, 15]      # ... and walks in from any side within this many frames (target)
+    distractor_entry_frames: [5, 45]
+  distractors:                 # other beetles in the same scene (the tracker must stick to object 0)
+    count: [0, 2]
+    cross_prob: 0.5            # a distractor heads for the target's start position (paths cross)
+  motion:
+    speed_px: [0.3, 5.0]       # per-sequence typical speed (px/frame), 80 % of the sequences ...
+    speed_tail_px: [5.0, 15.0] # ... and the fast tail (tail_prob)
+    tail_prob: 0.2
+    speed_sigma: 0.15          # random acceleration per frame (px/frame^2), pulled back to the typical speed
+    speed_relax: 0.05
+    heading_sigma_deg: 6       # random turning per frame
+    pause_prob: 0.01           # chance per frame to stop for pause_frames
+    pause_frames: [5, 30]
+    turn_back_margin: 0.15     # outside the view by more than this (x view half-size) the beetle turns back
+    pose_rate_deg: {azimuth: 3.0, elevation: 1.5, roll: 1.0}   # scale of the per-frame viewpoint change
+    elevation_deg: [0, 90]     # pose range (reflects at the limits)
+    roll_follows_heading: true # in-plane rotation turns with the walking direction
+    scale_step: 0.02           # max relative size change per frame (approaching / receding), slow random walk
+    scale_sigma: 0.008
+  camera:
+    static_prob: 0.2           # some sequences from a perfectly still camera
+    pan_px: [0.0, 3.0]         # per-sequence pan speed scale (px/frame): background and beetles move together
+    pan_relax: 0.05
+    shake_px: [0.0, 1.5]       # hand-held jitter (px, low-pass filtered)
+    zoom_rate: 0.01            # slow zoom in / out ...
+    zoom_range: [0.85, 1.2]
+    rot_rate_deg: 0.2          # ... and roll of the camera
+    rot_range_deg: [-5, 5]
+    canvas_margin: 0.2         # pan room on each side (x frame size); the background canvas is that much larger
+    exposure: [0.2, 0.6]       # shutter open fraction of the frame interval: motion blur = apparent motion x this
+  occlusion:                   # static leaves / background patches (compose.occlusion look), placed on the target's path
+    prob: 0.4
+    count: [1, 2]
+    size: [0.6, 1.8]           # occluder long side / beetle long side (bigger than 1 can hide it completely)
+    on_path_prob: 0.8          # else anywhere in the first view
+  gif:                         # animated GIF with the boxes per sequence -> <out>/_gifs/<split>/ (0 = off)
+    every: 1                   # every n-th sequence
+    max_side: 240
+    frame_step: 2
+
 resources:
   # RAM budget of the generator process. max_ram_gb is a hard cap on Windows (job object: allocations beyond
   # it fail with MemoryError instead of swapping) and a watchdog everywhere (aborts with a message).
@@ -179,6 +241,10 @@ resources:
   max_ram_gb: 16
   sprite_cache_gb: 4         # ~700 of 2048 px sprites; the rest are re-read from PNG when drawn (~20 ms each)
   occluder_cache_gb: 0.5
+  # Worker processes for the CPU-bound stages (compose, sequences): an int or auto = half of the cores (max 16).
+  # Each image / sequence is seeded by its index, so the output is identical whatever the worker count; the
+  # caches above are shared between the workers (each gets 1/workers of them).
+  workers: 1
 
 output:
   dir: outputs/dataset

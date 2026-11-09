@@ -17,8 +17,10 @@ python -m popsynth.cli generate -c configs/e_synth_40k.yaml
 python -m popsynth.cli stats   -c configs/e_synth_40k.yaml
 python -m popsynth.cli preview -c configs/e_synth_40k.yaml -n 24
 
-# if stage 2 dies partway, re-run only compose (re-uses the rendered sprites):
-#   python -m popsynth.cli compose -c configs/e_synth_40k.yaml
+# if stage 2 is stopped (Ctrl+C) or dies partway, continue it on 10 cores (resources.workers in the config; -j N overrides):
+#   python -m popsynth.cli compose -c configs/e_synth_40k.yaml --resume
+# a run stopped early and left as is: rebuild dataset.json / csv tables from what exists
+#   python -m popsynth.cli export -c configs/e_synth_40k.yaml
 
 # 5. repair the v2 run of 2026-11-04 in place (hidden beetles, blank frames); files go to E:\synth_v2\_removed
 #   python -m popsynth.cli clean -o E:/synth_v2 --dry-run

@@ -129,6 +129,7 @@ resources:                         # v3: no limits on the Windows GPU machine, u
   max_ram_gb: null                 # no hard cap, no watchdog
   sprite_cache_gb: 32              # all 5000 sprites stay decoded in RAM (~5 GB at their rendered sizes)
   occluder_cache_gb: 4             # every leaf cutout stays decoded
+  workers: 10                      # stage 2 on half of the 20 cores (--workers N overrides); stage 1 is the GPU
 
 output:
   dir: E:/synth_v3                  # existing, empty folder on the SSD (v2 = 2026-11-04 run, see `popsynth clean`)

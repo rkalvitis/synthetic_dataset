@@ -152,14 +152,38 @@ class BackgroundPool:
         files = self.groups[int(rng.choice(len(self.groups), p=self.probs))][2]
         return files[int(rng.integers(len(files)))]
 
+    def split(self, val_fraction: float, seed: int = 0) -> tuple["BackgroundPool", "BackgroundPool"]:
+        """Two pools with DISJOINT photos (a seeded random `val_fraction` of every folder goes to the second)."""
+        a, b = object.__new__(BackgroundPool), object.__new__(BackgroundPool)
+        for pool in (a, b):
+            pool.min_size, pool.probs, pool.group_dirs = self.min_size, self.probs, self.group_dirs
+            pool.groups = []
+        rng = np.random.default_rng([int(seed), 5])
+        for path, weight, files in self.groups:
+            n_val = int(round(len(files) * val_fraction)) if len(files) > 1 else 0
+            idx = set(rng.choice(len(files), size=n_val, replace=False).tolist()) if n_val else set()
+            a.groups.append((path, weight, [f for i, f in enumerate(files) if i not in idx]))
+            b.groups.append((path, weight, [f for i, f in enumerate(files) if i in idx]))
+        for pool in (a, b):
+            pool.paths = [p for g in pool.groups for p in g[2]]
+        return a, b
+
+    def ordered_paths(self, seed: int = 0) -> list[str]:
+        """Every photo once, in a seeded random order (used to give each sequence its own background)."""
+        perm = np.random.default_rng([int(seed), 6]).permutation(len(self.paths))
+        return [self.paths[i] for i in perm]
+
     def sample(self, rng: np.random.Generator, width: int, height: int,
-               crop_scale=(0.4, 1.0), hflip: float = 0.5) -> tuple[np.ndarray, dict]:
-        """Random crop (random size, same aspect as output) resized to (height,width). Returns float32 RGB in [0,1]."""
+               crop_scale=(0.4, 1.0), hflip: float = 0.5, path: str | None = None) -> tuple[np.ndarray, dict]:
+        """Random crop (random size, same aspect as output) resized to (height,width). Returns float32 RGB in [0,1].
+        `path` forces the photo (else one is drawn by folder weight)."""
         for _ in range(10):
-            path = self._pick(rng)
-            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            p = path or self._pick(rng)
+            img = cv2.imread(p, cv2.IMREAD_COLOR)
             if img is not None and min(img.shape[:2]) >= self.min_size:
+                path = p
                 break
+            path = None
         else:
             raise RuntimeError("could not load a background image")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
